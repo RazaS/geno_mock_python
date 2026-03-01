@@ -258,6 +258,7 @@ INDEX_HTML = """<!doctype html>
       display: flex;
       gap: 12px;
       flex: 1 1 auto;
+      height: 100%;
       min-height: 0;
       overflow: hidden;
     }
@@ -265,8 +266,8 @@ INDEX_HTML = """<!doctype html>
       flex: 0 0 24%;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr);
+      height: 100%;
       min-height: 0;
-      max-height: 60vh;
       overflow: hidden;
     }
     .gene-search-wrap {
@@ -276,6 +277,7 @@ INDEX_HTML = """<!doctype html>
     .a2-allele-b {
       flex: 1 1 76%;
       min-width: 0;
+      height: 100%;
       min-height: 0;
       display: flex;
       flex-direction: column;
@@ -991,7 +993,7 @@ INDEX_HTML = """<!doctype html>
         rowKey: (row, idx) => String(idx + 1),
         checkedSet: state.checked.gene,
         tableKey: "gene",
-        maxHeight: "68vh"
+        maxHeight: "100%"
       });
     }
 
@@ -1003,7 +1005,7 @@ INDEX_HTML = """<!doctype html>
         rowKey: (row, idx) => String(idx + 1),
         checkedSet: state.checked.exon,
         tableKey: "exon",
-        maxHeight: "68vh"
+        maxHeight: "100%"
       });
     }
 
@@ -1020,7 +1022,7 @@ INDEX_HTML = """<!doctype html>
           checkedSet: state.checked.detail,
           tableKey: "detail",
           multilineCols: ["Variants"],
-          maxHeight: "52vh",
+          maxHeight: "100%",
           onRowDblClick: (row) => {
             const alleleId = text(row.Allele_id);
             const linked = uniqueOrdered(DATA.bridge_by_allele[alleleId] || []);
@@ -1039,7 +1041,7 @@ INDEX_HTML = """<!doctype html>
           tableKey: "detail",
           truncateTooltipCols: ["Ref_allele_curated", "Alt_allele_curated"],
           truncateLength: 10,
-          maxHeight: "52vh",
+          maxHeight: "100%",
           onRowClick: (row) => {
             const variantId = text(row.Variant_id);
             const linked = uniqueOrdered(DATA.bridge_by_variant[variantId] || []);
