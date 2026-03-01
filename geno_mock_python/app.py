@@ -81,6 +81,11 @@ for source in (gene_table, allele_table, variant_table, exon_table):
             all_genes_set.add(gene)
 all_genes = sorted(all_genes_set)
 
+gene_view_cols = list(gene_table[0].keys()) if gene_table else []
+if "Gene_id" in gene_view_cols and "Gene" in gene_view_cols:
+    gene_view_cols = [col for col in gene_view_cols if col != "Gene"]
+    gene_id_idx = gene_view_cols.index("Gene_id")
+    gene_view_cols.insert(gene_id_idx + 1, "Gene")
 allele_view_cols = list(allele_table[0].keys()) if allele_table else []
 if "Variants" not in allele_view_cols:
     allele_view_cols.append("Variants")
@@ -103,7 +108,7 @@ INIT_PAYLOAD = {
         "bridge": len(bridge_table),
     },
     "columns": {
-        "gene_table": list(gene_table[0].keys()) if gene_table else [],
+        "gene_table": gene_view_cols,
         "allele_view": allele_view_cols,
         "variant_view": variant_view_cols,
         "exon_view": exon_view_cols,
@@ -150,9 +155,18 @@ INDEX_HTML = """<!doctype html>
     .panel-b {
       flex: 0 0 20%;
       min-width: 0;
+      min-height: 0;
+      height: 100%;
       display: flex;
       flex-direction: column;
       gap: 12px;
+      overflow: hidden;
+    }
+    .app-root.panel-b-collapsed .panel-a {
+      flex: 1 1 100%;
+    }
+    .app-root.panel-b-collapsed .panel-b {
+      display: none;
     }
     .section-box {
       border: 1px solid #c8c8c8;
@@ -178,6 +192,11 @@ INDEX_HTML = """<!doctype html>
       display: flex;
       gap: 8px;
       width: 100%;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .sidebar-toggle-wrap {
+      margin-left: auto;
     }
     .toggle-btn {
       border: 1px solid #b8b8b8;
@@ -205,11 +224,34 @@ INDEX_HTML = """<!doctype html>
       color: #555;
     }
     .b1-box {
-      flex: 0 0 38%;
+      flex: 0 0 26%;
+      min-height: 120px;
+      max-height: 220px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .b1-box h4 {
+      margin: 0 0 6px 0;
+      font-size: 14px;
+    }
+    #latest-updates {
+      font-size: 12px;
+      line-height: 1.3;
       overflow-y: auto;
+      min-height: 0;
+      padding-right: 4px;
+    }
+    #latest-updates ul {
+      margin: 0;
+      padding-left: 16px;
+    }
+    #latest-updates li {
+      margin-bottom: 4px;
     }
     .b2-box {
-      flex: 1 1 62%;
+      flex: 1 1 auto;
+      min-height: 0;
       overflow-y: auto;
     }
     .a2-allele-layout {
@@ -270,9 +312,15 @@ INDEX_HTML = """<!doctype html>
     }
     .detail-controls-grid {
       display: grid;
-      grid-template-columns: minmax(220px, 1fr) 160px 160px;
+      grid-template-columns: minmax(220px, 1fr) 140px 140px 170px;
       gap: 8px;
       align-items: end;
+    }
+    .a2-allele-layout.gene-selector-collapsed .a2-allele-a {
+      display: none;
+    }
+    .a2-allele-layout.gene-selector-collapsed .a2-allele-b {
+      flex: 1 1 100%;
     }
     .detail-table-wrap {
       flex: 1 1 auto;
@@ -436,13 +484,16 @@ INDEX_HTML = """<!doctype html>
             <button id="mode-gene" class="toggle-btn active">Gene Table</button>
             <button id="mode-allele" class="toggle-btn">Allele Table</button>
             <button id="mode-exon" class="toggle-btn">Exon Table</button>
+            <div class="sidebar-toggle-wrap">
+              <button id="toggle-panel-b" class="btn">Hide Sidebar</button>
+            </div>
           </div>
         </div>
         <div class="section-box a2-box">
           <div id="gene-mode"></div>
           <div id="exon-mode" class="hidden"></div>
           <div id="allele-mode" class="hidden">
-            <div class="a2-allele-layout">
+            <div id="allele-layout" class="a2-allele-layout">
               <div class="a2-allele-a">
                 <div class="gene-search-wrap">
                   <label for="gene-search">Search genes</label>
@@ -461,6 +512,7 @@ INDEX_HTML = """<!doctype html>
                     </div>
                     <button id="gran-allele" class="toggle-btn active">Allele</button>
                     <button id="gran-variant" class="toggle-btn">Variant</button>
+                    <button id="toggle-gene-selector" class="btn">Hide Gene Selector</button>
                   </div>
                 </div>
                 <div class="detail-table-wrap">
@@ -526,6 +578,8 @@ INDEX_HTML = """<!doctype html>
       geneSearch: "",
       granularity: "Allele",
       tableSearch: "",
+      panelBCollapsed: false,
+      alleleSelectorCollapsed: false,
       activeTable: "gene",
       checked: {
         gene: new Set(),
@@ -551,6 +605,25 @@ INDEX_HTML = """<!doctype html>
       return text(haystack).toLowerCase().includes(text(needle).toLowerCase());
     }
 
+    function parseSearchGroups(rawQuery) {
+      const query = text(rawQuery).trim();
+      if (!query) return [];
+      return query
+        .split(";")
+        .map((andPart) => andPart.trim())
+        .filter(Boolean)
+        .map((andPart) => andPart.split(",")
+          .map((orTerm) => orTerm.trim())
+          .filter(Boolean));
+    }
+
+    function matchesSearchGroups(haystack, rawQuery) {
+      const groups = parseSearchGroups(rawQuery);
+      if (groups.length === 0) return true;
+      const source = text(haystack).toLowerCase();
+      return groups.every((orGroup) => orGroup.some((term) => source.includes(term.toLowerCase())));
+    }
+
     function uniqueOrdered(list) {
       const out = [];
       const seen = new Set();
@@ -573,9 +646,8 @@ INDEX_HTML = """<!doctype html>
     }
 
     function getFilteredGenes() {
-      const q = state.geneSearch.trim().toLowerCase();
-      if (!q) return DATA.all_genes.slice();
-      return DATA.all_genes.filter((g) => g.toLowerCase().includes(q));
+      if (!state.geneSearch.trim()) return DATA.all_genes.slice();
+      return DATA.all_genes.filter((g) => matchesSearchGroups(g, state.geneSearch));
     }
 
     function ensureSelectedGene() {
@@ -595,10 +667,9 @@ INDEX_HTML = """<!doctype html>
       const source = state.granularity === "Allele" ? DATA.allele_table : DATA.variant_table;
       const rows = source.filter((r) => text(r.Gene) === state.selectedGene);
       if (!state.tableSearch.trim()) return rows;
-      const q = state.tableSearch.trim().toLowerCase();
       return rows.filter((row) => {
-        const joined = Object.values(row).map(text).join(" || ").toLowerCase();
-        return joined.includes(q);
+        const joined = Object.values(row).map(text).join(" || ");
+        return matchesSearchGroups(joined, state.tableSearch);
       });
     }
 
@@ -662,6 +733,26 @@ INDEX_HTML = """<!doctype html>
       const info = activeTableInfo();
       document.getElementById("download-context").textContent =
         "Active table: " + info.label + " | Checked rows: " + info.checked.size;
+    }
+
+    function applyLayoutState() {
+      const appRoot = document.querySelector(".app-root");
+      const panelBtn = document.getElementById("toggle-panel-b");
+      const alleleLayout = document.getElementById("allele-layout");
+      const alleleBtn = document.getElementById("toggle-gene-selector");
+
+      if (appRoot) {
+        appRoot.classList.toggle("panel-b-collapsed", state.panelBCollapsed);
+      }
+      if (panelBtn) {
+        panelBtn.textContent = state.panelBCollapsed ? "Show Sidebar" : "Hide Sidebar";
+      }
+      if (alleleLayout) {
+        alleleLayout.classList.toggle("gene-selector-collapsed", state.alleleSelectorCollapsed);
+      }
+      if (alleleBtn) {
+        alleleBtn.textContent = state.alleleSelectorCollapsed ? "Show Gene Selector" : "Hide Gene Selector";
+      }
     }
 
     function renderTable(containerId, config) {
@@ -962,6 +1053,7 @@ INDEX_HTML = """<!doctype html>
     }
 
     function refreshMainPanels() {
+      applyLayoutState();
       setActiveButtons();
       const geneMode = document.getElementById("gene-mode");
       const exonMode = document.getElementById("exon-mode");
@@ -1214,6 +1306,14 @@ INDEX_HTML = """<!doctype html>
         renderAlleleMode();
         updateStateField();
         updateDownloadContext();
+      });
+      document.getElementById("toggle-panel-b").addEventListener("click", () => {
+        state.panelBCollapsed = !state.panelBCollapsed;
+        applyLayoutState();
+      });
+      document.getElementById("toggle-gene-selector").addEventListener("click", () => {
+        state.alleleSelectorCollapsed = !state.alleleSelectorCollapsed;
+        applyLayoutState();
       });
       document.getElementById("download-main-btn").addEventListener("click", downloadMainSelection);
       document.getElementById("clear-main-btn").addEventListener("click", clearAllCheckedRows);
