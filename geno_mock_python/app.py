@@ -675,6 +675,7 @@ INDEX_HTML = """<!doctype html>
       const multilineCols = new Set(config.multilineCols || []);
       const truncateTooltipCols = new Set(config.truncateTooltipCols || []);
       const truncateLength = Number.isInteger(config.truncateLength) ? config.truncateLength : 10;
+      const wrapCols = new Set(["Allele_name", "Reference_No_PMID", "Accession_number", "Phenotype"]);
       const rowKey = typeof config.rowKey === "function"
         ? config.rowKey
         : ((row, idx) => String(idx + 1));
@@ -710,7 +711,7 @@ INDEX_HTML = """<!doctype html>
       columns.forEach((col) => {
         const th = document.createElement("th");
         th.textContent = col;
-        if (col === "Allele_name") th.classList.add("allele-name-col");
+        if (wrapCols.has(col)) th.classList.add("allele-name-col");
         htr.appendChild(th);
       });
       thead.appendChild(htr);
@@ -749,7 +750,7 @@ INDEX_HTML = """<!doctype html>
             td.textContent = fullText;
           }
           if (multilineCols.has(col)) td.classList.add("multiline");
-          if (col === "Allele_name") td.classList.add("allele-name-col");
+          if (wrapCols.has(col)) td.classList.add("allele-name-col");
           tr.appendChild(td);
         });
 
