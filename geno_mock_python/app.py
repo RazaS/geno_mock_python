@@ -314,6 +314,15 @@ INDEX_HTML = """<!doctype html>
     table.data-table td.multiline {
       white-space: pre-line;
     }
+    table.data-table th.allele-name-col,
+    table.data-table td.allele-name-col {
+      width: 25ch;
+      min-width: 25ch;
+      max-width: 25ch;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
     table.data-table tr.selected-row {
       background: #dbeafe;
     }
@@ -701,6 +710,7 @@ INDEX_HTML = """<!doctype html>
       columns.forEach((col) => {
         const th = document.createElement("th");
         th.textContent = col;
+        if (col === "Allele_name") th.classList.add("allele-name-col");
         htr.appendChild(th);
       });
       thead.appendChild(htr);
@@ -739,6 +749,7 @@ INDEX_HTML = """<!doctype html>
             td.textContent = fullText;
           }
           if (multilineCols.has(col)) td.classList.add("multiline");
+          if (col === "Allele_name") td.classList.add("allele-name-col");
           tr.appendChild(td);
         });
 
