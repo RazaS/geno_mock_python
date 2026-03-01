@@ -2,10 +2,13 @@
 import csv
 import json
 import os
+import re
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.error import URLError
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 
 def clean_text(value):
@@ -92,6 +95,513 @@ if "Variants" not in allele_view_cols:
 variant_view_cols = list(variant_table[0].keys()) if variant_table else []
 exon_view_cols = list(exon_table[0].keys()) if exon_table else []
 
+ISBT_SYSTEMS_URL = "https://api-blooddatabase.isbtweb.org/system"
+ISBT_ANTIGEN_URL = "https://api-blooddatabase.isbtweb.org/antigen/search?system_symbol="
+ISBT_ALLELE_URL = "https://api-blooddatabase.isbtweb.org/allele/search?system_symbol="
+ISBT_CACHE_PATH = ROOT_DIR / "isbt_cache.json"
+ISBT_CACHE_MAX_DAYS = 30
+ISBT_FLAG_COLS = ["sv_allele", "null_allele", "mod_allele", "partial_allele", "weak_allele", "el_allele"]
+ISBT_GROUPED_VIEW_COLS = [
+    "Group",
+    "Allele_id",
+    "ISBT_Allele",
+    "Gene_name",
+    "DNA Change",
+    "Exon/Intron",
+    "HGVS Transcript",
+    "sv_allele",
+    "null_allele",
+    "mod_allele",
+    "partial_allele",
+    "weak_allele",
+    "el_allele",
+]
+
+
+def now_utc_epoch():
+    return int(datetime.utcnow().timestamp())
+
+
+def extract_records(payload):
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("results", "data", "items", "systems", "antigens", "alleles", "variants"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return [payload]
+    return []
+
+
+def flatten_record(record, prefix=""):
+    out = {}
+    if not isinstance(record, dict):
+        return out
+    for key, value in record.items():
+        clean_key = clean_text(key).strip()
+        if not clean_key:
+            continue
+        full_key = f"{prefix}_{clean_key}" if prefix else clean_key
+        if isinstance(value, dict):
+            nested = flatten_record(value, full_key)
+            out.update(nested)
+        elif isinstance(value, list):
+            if all(not isinstance(item, (dict, list)) for item in value):
+                out[full_key] = ", ".join(clean_text(item) for item in value)
+            else:
+                out[full_key] = json.dumps(value, ensure_ascii=False)
+        else:
+            out[full_key] = clean_text(value)
+    return out
+
+
+def first_nonempty_ci(record, candidate_keys):
+    if not isinstance(record, dict):
+        return ""
+    for wanted in candidate_keys:
+        wanted_low = wanted.lower()
+        for key, value in record.items():
+            if clean_text(key).lower() == wanted_low:
+                txt = clean_text(value).strip()
+                if txt:
+                    return txt
+    return ""
+
+
+def to_bool_flag_text(value):
+    txt = clean_text(value).strip()
+    low = txt.lower()
+    if low in ("1", "true", "t", "yes", "y"):
+        return "Yes"
+    if low in ("0", "false", "f", "no", "n"):
+        return "No"
+    return txt
+
+
+def normalize_dna_change(raw_value):
+    txt = clean_text(raw_value).strip()
+    if not txt:
+        return "-"
+    if ":" in txt:
+        txt = txt.split(":", 1)[1].strip()
+    txt = re.sub(r"^(c\.[0-9_+\-*]+)[A-Za-z]+=$", r"\1=", txt)
+    return txt or "-"
+
+
+def normalize_exon_label(raw_value):
+    txt = clean_text(raw_value).strip()
+    if not txt:
+        return ""
+    low = txt.lower()
+    if low.startswith("exon"):
+        rest = txt[4:].strip()
+        return f"Exon {rest}" if rest else "Exon"
+    if re.fullmatch(r"-?\d+", txt):
+        return f"Exon {txt}"
+    return f"Exon {txt}"
+
+
+def normalize_intron_label(raw_value):
+    txt = clean_text(raw_value).strip()
+    if not txt:
+        return ""
+    low = txt.lower()
+    if low.startswith("intron"):
+        rest = txt[6:].strip()
+        return f"Intron {rest}" if rest else "Intron"
+    return f"Intron {txt}"
+
+
+def normalize_exon_intron(exon_value, intron_value):
+    exon_label = normalize_exon_label(exon_value)
+    intron_label = normalize_intron_label(intron_value)
+    if exon_label and intron_label:
+        return f"{exon_label} / {intron_label}"
+    if exon_label:
+        return exon_label
+    if intron_label:
+        return intron_label
+    return "-"
+
+
+def parse_c_position(dna_change):
+    txt = clean_text(dna_change)
+    match = re.search(r"c\.(-?\d+)", txt)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return 10**9
+    return 10**9
+
+
+def parse_isbt_number(record):
+    txt = first_nonempty_ci(record, ["isbt_number", "system_number", "number"])
+    match = re.search(r"\d+", txt)
+    if match:
+        try:
+            return int(match.group(0))
+        except ValueError:
+            return 10**9
+    return 10**9
+
+
+def fetch_json(url, timeout_sec=25):
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "geno-mock-python/1.0 (+https://github.com/RazaS/geno_mock_python)",
+        },
+    )
+    with urlopen(request, timeout=timeout_sec) as response:
+        body = response.read().decode("utf-8")
+    return json.loads(body)
+
+
+def variant_like_record(record):
+    check_fields = [
+        "input",
+        "dna_change",
+        "nucleotide_change",
+        "hgvs",
+        "hgvs_transcript",
+        "exon",
+        "intron",
+        "variant_id",
+    ]
+    return bool(first_nonempty_ci(record, check_fields))
+
+
+def dedupe_rows(rows, key_fields):
+    seen = set()
+    out = []
+    for row in rows:
+        key = tuple(clean_text(row.get(field, "")) for field in key_fields)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def variant_matches_group(variant_row, selected_group):
+    group = clean_text(selected_group).upper().strip()
+    symbol = first_nonempty_ci(variant_row, ["system_symbol"]).upper()
+    if group in ("RHD", "RHCE"):
+        isbt_allele = first_nonempty_ci(variant_row, ["isbt_allele"]).upper()
+        gene_name = first_nonempty_ci(variant_row, ["gene_name", "gene"]).upper()
+        return isbt_allele.startswith(group + "*") or gene_name == group
+    return symbol == group
+
+
+def make_isbt_grouped_rows(variants_rows):
+    by_group = {}
+    for row in variants_rows:
+        symbol = first_nonempty_ci(row, ["system_symbol"]).upper()
+        if not symbol:
+            continue
+        target_groups = [symbol]
+        if symbol == "RH":
+            target_groups = ["RHD", "RHCE"]
+        for group in target_groups:
+            if variant_matches_group(row, group):
+                by_group.setdefault(group, []).append(row)
+
+    grouped_rows = []
+    for group, group_rows in by_group.items():
+        by_allele = {}
+        for row in group_rows:
+            allele_id = first_nonempty_ci(row, ["allele_id"])
+            isbt_allele = first_nonempty_ci(row, ["isbt_allele"])
+            if not allele_id:
+                allele_id = isbt_allele or f"{group}:{len(by_allele) + 1}"
+            row_key = f"{group}|{allele_id}"
+            by_allele.setdefault(row_key, []).append(row)
+
+        for row_key, rows in by_allele.items():
+            rows_sorted = sorted(
+                rows,
+                key=lambda r: (
+                    parse_c_position(first_nonempty_ci(r, ["DNA Change", "dna_change", "input", "nucleotide_change", "hgvs"])),
+                    first_nonempty_ci(r, ["DNA Change", "dna_change", "input", "nucleotide_change", "hgvs"]),
+                ),
+            )
+
+            dna_lines = []
+            exon_intron_lines = []
+            hgvs_lines = []
+            for raw in rows_sorted:
+                dna_lines.append(first_nonempty_ci(raw, ["DNA Change", "dna_change", "input", "nucleotide_change", "hgvs"]) or "-")
+                exon_intron_lines.append(first_nonempty_ci(raw, ["Exon/Intron", "exon_intron"]) or "-")
+                hgvs_lines.append(first_nonempty_ci(raw, ["HGVS Transcript", "hgvs_transcript", "input", "hgvs"]) or "-")
+
+            first_row = rows_sorted[0]
+            grouped_row = {
+                "Group": group,
+                "Allele_id": first_nonempty_ci(first_row, ["allele_id"]),
+                "ISBT_Allele": first_nonempty_ci(first_row, ["isbt_allele", "allele_name"]),
+                "Gene_name": first_nonempty_ci(first_row, ["gene_name", "gene"]),
+                "DNA Change": "\n".join(dna_lines),
+                "Exon/Intron": "\n".join(exon_intron_lines),
+                "HGVS Transcript": "\n".join(hgvs_lines),
+                "__group": group,
+                "__row_key": row_key,
+                "__raw_variant_rows": rows_sorted,
+            }
+            for flag_col in ISBT_FLAG_COLS:
+                grouped_row[flag_col] = first_nonempty_ci(first_row, [flag_col])
+            grouped_rows.append(grouped_row)
+
+    grouped_rows.sort(
+        key=lambda row: (
+            clean_text(row.get("Group", "")),
+            clean_text(row.get("ISBT_Allele", "")),
+            clean_text(row.get("Allele_id", "")),
+        )
+    )
+    return grouped_rows
+
+
+def build_isbt_dataset():
+    systems_payload = fetch_json(ISBT_SYSTEMS_URL)
+    systems_raw = extract_records(systems_payload)
+
+    systems = []
+    symbols = []
+    for record in systems_raw:
+        flat = flatten_record(record)
+        symbol = first_nonempty_ci(flat, ["system_symbol", "symbol"]).upper()
+        if not symbol:
+            continue
+        flat["system_symbol"] = symbol
+        systems.append(flat)
+        symbols.append(symbol)
+
+    systems = sorted(
+        dedupe_rows(systems, ["system_symbol"]),
+        key=lambda row: (parse_isbt_number(row), clean_text(row.get("system_symbol", ""))),
+    )
+    symbols = [clean_text(row.get("system_symbol", "")).upper() for row in systems]
+
+    antigens = []
+    alleles = []
+    variants = []
+    pull_errors = []
+
+    for symbol in symbols:
+        if not symbol:
+            continue
+
+        try:
+            antigen_payload = fetch_json(ISBT_ANTIGEN_URL + quote(symbol))
+            antigen_rows = extract_records(antigen_payload)
+        except Exception as exc:
+            pull_errors.append(f"antigen:{symbol}:{clean_text(exc)}")
+            antigen_rows = []
+        for record in antigen_rows:
+            flat = flatten_record(record)
+            flat["system_symbol"] = symbol
+            antigens.append(flat)
+
+        try:
+            allele_payload = fetch_json(ISBT_ALLELE_URL + quote(symbol))
+            allele_rows = extract_records(allele_payload)
+        except Exception as exc:
+            pull_errors.append(f"allele:{symbol}:{clean_text(exc)}")
+            allele_rows = []
+        for record in allele_rows:
+            if not isinstance(record, dict):
+                continue
+            flat_allele = flatten_record(record)
+            flat_allele["system_symbol"] = symbol
+
+            allele_id = first_nonempty_ci(flat_allele, ["allele_id", "id"])
+            if not allele_id:
+                allele_id = f"{symbol}:{len(alleles) + 1}"
+            flat_allele["allele_id"] = allele_id
+            flat_allele["isbt_allele"] = first_nonempty_ci(flat_allele, ["isbt_allele", "allele_name", "name"])
+            flat_allele["gene_name"] = first_nonempty_ci(flat_allele, ["gene_name", "gene", "gene_symbol"])
+
+            for flag_col in ISBT_FLAG_COLS:
+                flat_allele[flag_col] = to_bool_flag_text(first_nonempty_ci(flat_allele, [flag_col]))
+
+            alleles.append(flat_allele)
+
+            nested_variants = []
+            for key in ("variants", "variant", "variant_list", "allele_variants"):
+                value = record.get(key)
+                if isinstance(value, list):
+                    nested_variants = [item for item in value if isinstance(item, dict)]
+                    if nested_variants:
+                        break
+
+            if nested_variants:
+                for variant_record in nested_variants:
+                    flat_variant = flatten_record(variant_record)
+                    flat_variant["system_symbol"] = symbol
+                    flat_variant["allele_id"] = allele_id
+                    if not first_nonempty_ci(flat_variant, ["isbt_allele"]):
+                        flat_variant["isbt_allele"] = flat_allele.get("isbt_allele", "")
+                    if not first_nonempty_ci(flat_variant, ["gene_name", "gene"]):
+                        flat_variant["gene_name"] = flat_allele.get("gene_name", "")
+                    variants.append(flat_variant)
+            elif variant_like_record(flat_allele):
+                variants.append(dict(flat_allele))
+
+    allele_by_id = {}
+    for row in alleles:
+        allele_id = clean_text(row.get("allele_id", ""))
+        if not allele_id:
+            continue
+        if allele_id not in allele_by_id:
+            allele_by_id[allele_id] = dict(row)
+            continue
+        existing = allele_by_id[allele_id]
+        for key, value in row.items():
+            if value and not clean_text(existing.get(key, "")).strip():
+                existing[key] = value
+    alleles = list(allele_by_id.values())
+
+    allele_flags_by_id = {
+        clean_text(row.get("allele_id", "")): {flag: clean_text(row.get(flag, "")) for flag in ISBT_FLAG_COLS}
+        for row in alleles
+    }
+
+    normalized_variants = []
+    for idx, row in enumerate(variants, start=1):
+        out = dict(row)
+        allele_id = first_nonempty_ci(out, ["allele_id"])
+        if not allele_id:
+            allele_id = f"missing:{idx}"
+        out["allele_id"] = allele_id
+        out["isbt_allele"] = first_nonempty_ci(out, ["isbt_allele", "allele_name"])
+        out["gene_name"] = first_nonempty_ci(out, ["gene_name", "gene", "gene_symbol"])
+        out["variant_id"] = first_nonempty_ci(out, ["variant_id", "id"]) or f"v:{idx}"
+
+        dna_change = normalize_dna_change(first_nonempty_ci(out, ["input", "dna_change", "nucleotide_change", "hgvs", "hgvs_c"]))
+        exon_value = first_nonempty_ci(out, ["exon", "exon_number", "exon_no"])
+        intron_value = first_nonempty_ci(out, ["intron", "intron_number", "intron_no"])
+        exon_intron = normalize_exon_intron(exon_value, intron_value)
+        hgvs_transcript = clean_text(first_nonempty_ci(out, ["input", "hgvs_transcript", "hgvs"])).strip() or "-"
+
+        out["DNA Change"] = dna_change
+        out["Exon/Intron"] = exon_intron
+        out["HGVS Transcript"] = hgvs_transcript
+
+        allele_flags = allele_flags_by_id.get(allele_id, {})
+        for flag_col in ISBT_FLAG_COLS:
+            if not first_nonempty_ci(out, [flag_col]):
+                out[flag_col] = allele_flags.get(flag_col, "")
+            out[flag_col] = to_bool_flag_text(out.get(flag_col, ""))
+
+        normalized_variants.append(out)
+
+    variants = dedupe_rows(
+        normalized_variants,
+        ["system_symbol", "allele_id", "variant_id", "DNA Change", "Exon/Intron", "HGVS Transcript"],
+    )
+    antigens = dedupe_rows(antigens, ["system_symbol", "antigen_id", "id", "name"])
+
+    group_symbols = [clean_text(row.get("system_symbol", "")).upper() for row in systems if clean_text(row.get("system_symbol", ""))]
+    groups = []
+    for symbol in group_symbols:
+        if symbol == "RH":
+            groups.extend(["RHD", "RHCE"])
+        else:
+            groups.append(symbol)
+    groups = unique_keep_order(groups)
+
+    grouped_rows = make_isbt_grouped_rows(variants)
+    raw_export_columns = sorted({key for row in variants for key in row.keys() if not key.startswith("__")})
+
+    meta = {
+        "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "updated_epoch": now_utc_epoch(),
+        "source_urls": [ISBT_SYSTEMS_URL, ISBT_ANTIGEN_URL + "<SYMBOL>", ISBT_ALLELE_URL + "<SYMBOL>"],
+        "row_counts": {
+            "systems": len(systems),
+            "antigens": len(antigens),
+            "alleles": len(alleles),
+            "variants": len(variants),
+            "grouped_rows": len(grouped_rows),
+        },
+        "pull_errors": pull_errors,
+    }
+
+    return {
+        "metadata": meta,
+        "systems": systems,
+        "antigens": antigens,
+        "alleles": alleles,
+        "variants": variants,
+        "groups": groups,
+        "grouped_rows": grouped_rows,
+        "columns": {
+            "grouped_view": ISBT_GROUPED_VIEW_COLS,
+            "raw_export": raw_export_columns,
+        },
+    }
+
+
+def empty_isbt_dataset(error_message=""):
+    return {
+        "metadata": {
+            "updated_at": "Not available",
+            "updated_epoch": 0,
+            "source_urls": [ISBT_SYSTEMS_URL, ISBT_ANTIGEN_URL + "<SYMBOL>", ISBT_ALLELE_URL + "<SYMBOL>"],
+            "row_counts": {"systems": 0, "antigens": 0, "alleles": 0, "variants": 0, "grouped_rows": 0},
+            "pull_errors": [],
+            "error": clean_text(error_message),
+        },
+        "systems": [],
+        "antigens": [],
+        "alleles": [],
+        "variants": [],
+        "groups": [],
+        "grouped_rows": [],
+        "columns": {"grouped_view": ISBT_GROUPED_VIEW_COLS, "raw_export": []},
+    }
+
+
+def load_isbt_dataset():
+    cached = None
+    if ISBT_CACHE_PATH.exists():
+        try:
+            with ISBT_CACHE_PATH.open("r", encoding="utf-8") as handle:
+                cached = json.load(handle)
+        except Exception:
+            cached = None
+
+    if cached:
+        updated_epoch = int(cached.get("metadata", {}).get("updated_epoch", 0) or 0)
+        if updated_epoch > 0:
+            age_days = (now_utc_epoch() - updated_epoch) / 86400.0
+            if age_days <= ISBT_CACHE_MAX_DAYS:
+                return cached
+
+    try:
+        fresh = build_isbt_dataset()
+    except (URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError) as exc:
+        if cached:
+            cached_meta = cached.setdefault("metadata", {})
+            cached_meta["refresh_error"] = clean_text(exc)
+            return cached
+        return empty_isbt_dataset(clean_text(exc))
+
+    # Cache write failures should not discard freshly pulled data.
+    try:
+        with ISBT_CACHE_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(fresh, handle, ensure_ascii=False)
+    except OSError as exc:
+        fresh_meta = fresh.setdefault("metadata", {})
+        fresh_meta["cache_write_error"] = clean_text(exc)
+    return fresh
+
+
+isbt_data = load_isbt_dataset()
+
 INIT_PAYLOAD = {
     "gene_table": gene_table,
     "allele_table": allele_table,
@@ -106,6 +616,7 @@ INIT_PAYLOAD = {
         "variant": len(variant_table),
         "exon": len(exon_table),
         "bridge": len(bridge_table),
+        "isbt_grouped": len(isbt_data.get("grouped_rows", [])),
     },
     "columns": {
         "gene_table": gene_view_cols,
@@ -113,6 +624,7 @@ INIT_PAYLOAD = {
         "variant_view": variant_view_cols,
         "exon_view": exon_view_cols,
     },
+    "isbt": isbt_data,
 }
 
 FEEDBACK_LOG = []
@@ -324,6 +836,43 @@ INDEX_HTML = """<!doctype html>
     .a2-allele-layout.gene-selector-collapsed .a2-allele-b {
       flex: 1 1 100%;
     }
+    .a2-isbt-layout {
+      display: flex;
+      gap: 12px;
+      flex: 1 1 auto;
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .a2-isbt-a {
+      flex: 0 0 24%;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .a2-isbt-b {
+      flex: 1 1 76%;
+      min-width: 0;
+      height: 100%;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .isbt-controls-grid {
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) 190px;
+      gap: 8px;
+      align-items: end;
+    }
+    .a2-isbt-layout.group-selector-collapsed .a2-isbt-a {
+      display: none;
+    }
+    .a2-isbt-layout.group-selector-collapsed .a2-isbt-b {
+      flex: 1 1 100%;
+    }
     .detail-table-wrap {
       flex: 1 1 auto;
       min-height: 0;
@@ -465,10 +1014,10 @@ INDEX_HTML = """<!doctype html>
       .a2-allele-layout {
         flex-direction: column;
       }
-      .a2-allele-a, .a2-allele-b {
+      .a2-allele-a, .a2-allele-b, .a2-isbt-a, .a2-isbt-b {
         max-height: none;
       }
-      .detail-controls-grid {
+      .detail-controls-grid, .isbt-controls-grid {
         grid-template-columns: 1fr;
       }
       .gene-list-wrap {
@@ -486,6 +1035,7 @@ INDEX_HTML = """<!doctype html>
             <button id="mode-gene" class="toggle-btn active">Gene Table</button>
             <button id="mode-allele" class="toggle-btn">Allele Table</button>
             <button id="mode-exon" class="toggle-btn">Exon Table</button>
+            <button id="mode-isbt" class="toggle-btn">ISBT Table</button>
             <div class="sidebar-toggle-wrap">
               <button id="toggle-panel-b" class="btn">Hide Sidebar</button>
             </div>
@@ -519,6 +1069,34 @@ INDEX_HTML = """<!doctype html>
                 </div>
                 <div class="detail-table-wrap">
                   <div id="detail-table"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="isbt-mode" class="hidden">
+            <div id="isbt-layout" class="a2-isbt-layout">
+              <div class="a2-isbt-a">
+                <div class="gene-search-wrap">
+                  <label for="isbt-group-search">Search groups</label>
+                  <input id="isbt-group-search" class="input" type="text" placeholder="Type to filter ISBT groups" />
+                </div>
+                <div class="gene-list-wrap">
+                  <div id="isbt-group-selector-table"></div>
+                </div>
+              </div>
+              <div class="a2-isbt-b">
+                <div class="detail-controls">
+                  <div class="isbt-controls-grid">
+                    <div>
+                      <label for="isbt-table-search">Search ISBT table</label>
+                      <input id="isbt-table-search" class="input" type="text" placeholder="Filter grouped allele rows" />
+                    </div>
+                    <div id="isbt-last-updated" class="download-note"></div>
+                    <button id="toggle-isbt-selector" class="btn">Hide Group Selector</button>
+                  </div>
+                </div>
+                <div class="detail-table-wrap">
+                  <div id="isbt-detail-table"></div>
                 </div>
               </div>
             </div>
@@ -580,13 +1158,18 @@ INDEX_HTML = """<!doctype html>
       geneSearch: "",
       granularity: "Allele",
       tableSearch: "",
+      selectedIsbtGroup: "",
+      isbtGroupSearch: "",
+      isbtTableSearch: "",
       panelBCollapsed: false,
       alleleSelectorCollapsed: false,
+      isbtSelectorCollapsed: false,
       activeTable: "gene",
       checked: {
         gene: new Set(),
         exon: new Set(),
         detail: new Set(),
+        isbtDetail: new Set(),
         modalVariants: new Set(),
         modalAlleles: new Set()
       },
@@ -675,6 +1258,37 @@ INDEX_HTML = """<!doctype html>
       });
     }
 
+    function getFilteredIsbtGroups() {
+      const groups = (DATA.isbt && Array.isArray(DATA.isbt.groups)) ? DATA.isbt.groups : [];
+      if (!state.isbtGroupSearch.trim()) return groups.slice();
+      return groups.filter((group) => matchesSearchGroups(group, state.isbtGroupSearch));
+    }
+
+    function ensureSelectedIsbtGroup() {
+      const groups = getFilteredIsbtGroups();
+      if (groups.length === 0) {
+        state.selectedIsbtGroup = "";
+        return;
+      }
+      if (!groups.includes(state.selectedIsbtGroup)) {
+        state.selectedIsbtGroup = groups[0];
+        state.checked.isbtDetail.clear();
+      }
+    }
+
+    function isbtDetailBaseRows() {
+      if (!state.selectedIsbtGroup || !DATA.isbt || !Array.isArray(DATA.isbt.grouped_rows)) return [];
+      const rows = DATA.isbt.grouped_rows.filter((row) => text(row.__group) === state.selectedIsbtGroup);
+      if (!state.isbtTableSearch.trim()) return rows;
+      return rows.filter((row) => {
+        const joined = Object.values(row)
+          .filter((value) => !Array.isArray(value) && typeof value !== "object")
+          .map(text)
+          .join(" || ");
+        return matchesSearchGroups(joined, state.isbtTableSearch);
+      });
+    }
+
     function mapRowsByIds(sourceRows, idField, ids) {
       const byId = new Map();
       sourceRows.forEach((row) => byId.set(text(row[idField]), row));
@@ -690,21 +1304,28 @@ INDEX_HTML = """<!doctype html>
       document.getElementById("mode-gene").classList.toggle("active", state.mode === "GT");
       document.getElementById("mode-allele").classList.toggle("active", state.mode === "AT");
       document.getElementById("mode-exon").classList.toggle("active", state.mode === "ET");
+      document.getElementById("mode-isbt").classList.toggle("active", state.mode === "IT");
       document.getElementById("gran-allele").classList.toggle("active", state.granularity === "Allele");
       document.getElementById("gran-variant").classList.toggle("active", state.granularity === "Variant");
     }
 
     function currentVisibleStateText() {
-      const modeLabel = state.mode === "GT" ? "Gene" : (state.mode === "AT" ? "Allele" : "Exon");
-      const geneLabel = state.mode === "AT" ? (state.selectedGene || "") : "N/A";
+      const modeLabel = state.mode === "GT"
+        ? "Gene"
+        : (state.mode === "AT" ? "Allele" : (state.mode === "IT" ? "ISBT" : "Exon"));
+      const geneLabel = state.mode === "AT"
+        ? (state.selectedGene || "")
+        : (state.mode === "IT" ? (state.selectedIsbtGroup || "") : "N/A");
       const viewLabel = state.mode === "AT"
         ? state.granularity + "_Table"
-        : (state.mode === "ET" ? "Exon_Table" : "N/A");
+        : (state.mode === "ET" ? "Exon_Table" : (state.mode === "IT" ? "ISBT_Grouped_Table" : "N/A"));
       return "Mode: " + modeLabel
         + " | Gene: " + geneLabel
         + " | B2 View: " + viewLabel
         + " | GeneSearch: " + state.geneSearch
-        + " | TableSearch: " + state.tableSearch;
+        + " | TableSearch: " + state.tableSearch
+        + " | ISBTGroupSearch: " + state.isbtGroupSearch
+        + " | ISBTTableSearch: " + state.isbtTableSearch;
     }
 
     function updateStateField() {
@@ -721,6 +1342,9 @@ INDEX_HTML = """<!doctype html>
       if (state.activeTable === "detail") {
         const label = state.granularity === "Allele" ? "Allele Detail Table" : "Variant Detail Table";
         return { label: label, checked: state.checked.detail };
+      }
+      if (state.activeTable === "isbtDetail") {
+        return { label: "ISBT Grouped Table", checked: state.checked.isbtDetail };
       }
       if (state.activeTable === "modalVariants") {
         return { label: "Variants Popup Table", checked: state.checked.modalVariants };
@@ -742,6 +1366,8 @@ INDEX_HTML = """<!doctype html>
       const panelBtn = document.getElementById("toggle-panel-b");
       const alleleLayout = document.getElementById("allele-layout");
       const alleleBtn = document.getElementById("toggle-gene-selector");
+      const isbtLayout = document.getElementById("isbt-layout");
+      const isbtBtn = document.getElementById("toggle-isbt-selector");
 
       if (appRoot) {
         appRoot.classList.toggle("panel-b-collapsed", state.panelBCollapsed);
@@ -754,6 +1380,12 @@ INDEX_HTML = """<!doctype html>
       }
       if (alleleBtn) {
         alleleBtn.textContent = state.alleleSelectorCollapsed ? "Show Gene Selector" : "Hide Gene Selector";
+      }
+      if (isbtLayout) {
+        isbtLayout.classList.toggle("group-selector-collapsed", state.isbtSelectorCollapsed);
+      }
+      if (isbtBtn) {
+        isbtBtn.textContent = state.isbtSelectorCollapsed ? "Show Group Selector" : "Hide Group Selector";
       }
     }
 
@@ -916,11 +1548,71 @@ INDEX_HTML = """<!doctype html>
       container.appendChild(shell);
     }
 
+    function renderIsbtGroupSelectorTable() {
+      const container = document.getElementById("isbt-group-selector-table");
+      container.innerHTML = "";
+
+      const groups = getFilteredIsbtGroups();
+      const shell = document.createElement("div");
+      shell.className = "table-shell";
+      shell.style.height = "100%";
+      shell.style.maxHeight = "100%";
+
+      if (groups.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "muted";
+        empty.style.padding = "10px";
+        const isbtMeta = (DATA.isbt && DATA.isbt.metadata) ? DATA.isbt.metadata : {};
+        const loadError = text(isbtMeta.error || isbtMeta.refresh_error || "");
+        empty.textContent = loadError
+          ? ("ISBT data unavailable: " + loadError)
+          : "No ISBT groups match the current search.";
+        shell.appendChild(empty);
+        container.appendChild(shell);
+        return;
+      }
+
+      const table = document.createElement("table");
+      table.className = "data-table";
+      const thead = document.createElement("thead");
+      const htr = document.createElement("tr");
+      const th = document.createElement("th");
+      th.textContent = "Group";
+      htr.appendChild(th);
+      thead.appendChild(htr);
+      table.appendChild(thead);
+
+      const tbody = document.createElement("tbody");
+      groups.forEach((group) => {
+        const tr = document.createElement("tr");
+        if (group === state.selectedIsbtGroup) tr.classList.add("selected-row");
+        const td = document.createElement("td");
+        td.textContent = group;
+        tr.appendChild(td);
+        tr.addEventListener("click", () => {
+          if (state.selectedIsbtGroup !== group) {
+            state.selectedIsbtGroup = group;
+            state.checked.isbtDetail.clear();
+            renderIsbtMode();
+            updateStateField();
+            updateDownloadContext();
+          }
+        });
+        tbody.appendChild(tr);
+      });
+
+      table.appendChild(tbody);
+      shell.appendChild(table);
+      container.appendChild(shell);
+    }
+
     function setActiveMainTableForMode() {
       if (state.mode === "GT") {
         state.activeTable = "gene";
       } else if (state.mode === "ET") {
         state.activeTable = "exon";
+      } else if (state.mode === "IT") {
+        state.activeTable = "isbtDetail";
       } else {
         state.activeTable = "detail";
       }
@@ -1054,26 +1746,69 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
+    function renderIsbtMode() {
+      ensureSelectedIsbtGroup();
+      renderIsbtGroupSelectorTable();
+
+      const lastUpdated = document.getElementById("isbt-last-updated");
+      const isbtMeta = (DATA.isbt && DATA.isbt.metadata) ? DATA.isbt.metadata : {};
+      const updatedText = text(isbtMeta.updated_at || "Not available");
+      const groupedCount = Number((isbtMeta.row_counts || {}).grouped_rows || 0).toLocaleString();
+      const metaNotes = [];
+      if (isbtMeta.refresh_error) metaNotes.push("refresh error");
+      if (isbtMeta.cache_write_error) metaNotes.push("cache not persisted");
+      if (lastUpdated) {
+        const noteSuffix = metaNotes.length > 0 ? (" | Notes: " + metaNotes.join(", ")) : "";
+        lastUpdated.textContent = "Last pulled: " + updatedText + " | Grouped rows: " + groupedCount + noteSuffix;
+      }
+
+      const detailRows = isbtDetailBaseRows();
+      const columns = (DATA.isbt && DATA.isbt.columns && Array.isArray(DATA.isbt.columns.grouped_view))
+        ? DATA.isbt.columns.grouped_view
+        : [];
+      const displayRows = detailRows.map((row) => normalizeRow(row, columns));
+
+      renderTable("isbt-detail-table", {
+        rows: displayRows,
+        columns: columns,
+        rowKey: (row, idx) => String(idx + 1),
+        checkedSet: state.checked.isbtDetail,
+        tableKey: "isbtDetail",
+        multilineCols: ["DNA Change", "Exon/Intron", "HGVS Transcript"],
+        maxHeight: "100%"
+      });
+    }
+
     function refreshMainPanels() {
       applyLayoutState();
       setActiveButtons();
       const geneMode = document.getElementById("gene-mode");
       const exonMode = document.getElementById("exon-mode");
       const alleleMode = document.getElementById("allele-mode");
+      const isbtMode = document.getElementById("isbt-mode");
       if (state.mode === "GT") {
         geneMode.classList.remove("hidden");
         exonMode.classList.add("hidden");
         alleleMode.classList.add("hidden");
+        isbtMode.classList.add("hidden");
         renderGeneMode();
       } else if (state.mode === "ET") {
         geneMode.classList.add("hidden");
         exonMode.classList.remove("hidden");
         alleleMode.classList.add("hidden");
+        isbtMode.classList.add("hidden");
         renderExonMode();
+      } else if (state.mode === "IT") {
+        geneMode.classList.add("hidden");
+        exonMode.classList.add("hidden");
+        alleleMode.classList.add("hidden");
+        isbtMode.classList.remove("hidden");
+        renderIsbtMode();
       } else {
         geneMode.classList.add("hidden");
         exonMode.classList.add("hidden");
         alleleMode.classList.remove("hidden");
+        isbtMode.classList.add("hidden");
         renderAlleleMode();
       }
       updateStateField();
@@ -1084,6 +1819,7 @@ INDEX_HTML = """<!doctype html>
       state.checked.gene.clear();
       state.checked.exon.clear();
       state.checked.detail.clear();
+      state.checked.isbtDetail.clear();
       state.checked.modalVariants.clear();
       state.checked.modalAlleles.clear();
       refreshMainPanels();
@@ -1128,6 +1864,15 @@ INDEX_HTML = """<!doctype html>
       return idx.map((n) => sourceRows[n - 1]);
     }
 
+    function expandIsbtGroupedRows(groupedRows) {
+      const rawRows = [];
+      groupedRows.forEach((row) => {
+        const variants = Array.isArray(row.__raw_variant_rows) ? row.__raw_variant_rows : [];
+        variants.forEach((raw) => rawRows.push(raw));
+      });
+      return rawRows;
+    }
+
     function downloadMainSelection() {
       let rows = [];
       let columns = [];
@@ -1160,6 +1905,14 @@ INDEX_HTML = """<!doctype html>
         columns = DATA.columns.allele_view;
         rows = checkedRowsByIndex(state.modal.rows, state.checked.modalAlleles).map((r) => normalizeRow(r, columns));
         filename = "alleles_popup_checked_rows_" + dateTag + ".csv";
+      } else if (state.activeTable === "isbtDetail") {
+        columns = (DATA.isbt && DATA.isbt.columns && Array.isArray(DATA.isbt.columns.raw_export))
+          ? DATA.isbt.columns.raw_export
+          : [];
+        const groupedRows = checkedRowsByIndex(isbtDetailBaseRows(), state.checked.isbtDetail);
+        const rawRows = expandIsbtGroupedRows(groupedRows);
+        rows = rawRows.map((r) => normalizeRow(r, columns));
+        filename = "isbt_grouped_selection_expanded_" + dateTag + ".csv";
       }
 
       saveCsv(rows, columns, filename);
@@ -1198,10 +1951,28 @@ INDEX_HTML = """<!doctype html>
         "Loaded Variant_table: " + DATA.counts.variant.toLocaleString() + " rows",
         "Loaded Exon_table: " + DATA.counts.exon.toLocaleString() + " rows",
         "Loaded Bridge_table: " + DATA.counts.bridge.toLocaleString() + " rows",
+        "Loaded ISBT grouped rows: " + DATA.counts.isbt_grouped.toLocaleString() + " rows",
         "Use A1 buttons to switch between Gene, Allele, and Exon exploration modes.",
+        "ISBT mode groups rows by allele and can export expanded raw variants.",
         "Allele rows: double-click to inspect linked variants.",
         "Variant rows: single-click to inspect linked alleles."
       ];
+      if (DATA.isbt && DATA.isbt.metadata) {
+        lines.push("ISBT last pulled: " + text(DATA.isbt.metadata.updated_at || "Not available"));
+        const pullErrors = Array.isArray(DATA.isbt.metadata.pull_errors) ? DATA.isbt.metadata.pull_errors : [];
+        if (pullErrors.length > 0) {
+          lines.push("ISBT refresh warnings: " + pullErrors.length.toLocaleString() + " symbol-level fetch errors.");
+        }
+        if (DATA.isbt.metadata.refresh_error) {
+          lines.push("ISBT refresh error: " + text(DATA.isbt.metadata.refresh_error));
+        }
+        if (DATA.isbt.metadata.error) {
+          lines.push("ISBT load error: " + text(DATA.isbt.metadata.error));
+        }
+        if (DATA.isbt.metadata.cache_write_error) {
+          lines.push("ISBT cache write warning: " + text(DATA.isbt.metadata.cache_write_error));
+        }
+      }
       lines.forEach((line) => {
         const li = document.createElement("li");
         li.textContent = line;
@@ -1274,6 +2045,11 @@ INDEX_HTML = """<!doctype html>
         setActiveMainTableForMode();
         refreshMainPanels();
       });
+      document.getElementById("mode-isbt").addEventListener("click", () => {
+        state.mode = "IT";
+        setActiveMainTableForMode();
+        refreshMainPanels();
+      });
       document.getElementById("gran-allele").addEventListener("click", () => {
         if (state.granularity !== "Allele") {
           state.granularity = "Allele";
@@ -1309,12 +2085,31 @@ INDEX_HTML = """<!doctype html>
         updateStateField();
         updateDownloadContext();
       });
+      document.getElementById("isbt-group-search").addEventListener("input", (ev) => {
+        state.isbtGroupSearch = ev.target.value || "";
+        ensureSelectedIsbtGroup();
+        state.checked.isbtDetail.clear();
+        renderIsbtMode();
+        updateStateField();
+        updateDownloadContext();
+      });
+      document.getElementById("isbt-table-search").addEventListener("input", (ev) => {
+        state.isbtTableSearch = ev.target.value || "";
+        state.checked.isbtDetail.clear();
+        renderIsbtMode();
+        updateStateField();
+        updateDownloadContext();
+      });
       document.getElementById("toggle-panel-b").addEventListener("click", () => {
         state.panelBCollapsed = !state.panelBCollapsed;
         applyLayoutState();
       });
       document.getElementById("toggle-gene-selector").addEventListener("click", () => {
         state.alleleSelectorCollapsed = !state.alleleSelectorCollapsed;
+        applyLayoutState();
+      });
+      document.getElementById("toggle-isbt-selector").addEventListener("click", () => {
+        state.isbtSelectorCollapsed = !state.isbtSelectorCollapsed;
         applyLayoutState();
       });
       document.getElementById("download-main-btn").addEventListener("click", downloadMainSelection);
@@ -1333,6 +2128,9 @@ INDEX_HTML = """<!doctype html>
       const response = await fetch("/api/init");
       DATA = await response.json();
       state.selectedGene = DATA.all_genes.length > 0 ? DATA.all_genes[0] : "";
+      state.selectedIsbtGroup = (DATA.isbt && Array.isArray(DATA.isbt.groups) && DATA.isbt.groups.length > 0)
+        ? DATA.isbt.groups[0]
+        : "";
       bindEvents();
       renderLatestUpdates();
       renderFeedbackStatus(null);
