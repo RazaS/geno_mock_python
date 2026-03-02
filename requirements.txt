@@ -1,1 +1,2 @@
-# No third-party dependencies required.
+dna-features-viewer
+matplotlib

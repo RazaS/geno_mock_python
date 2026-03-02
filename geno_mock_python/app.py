@@ -1,14 +1,39 @@
 #!/usr/bin/env python3
+import base64
 import csv
 import json
 import os
 import re
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
+
+MPL_CACHE_DIR = os.environ.get("MPLCONFIGDIR", "/tmp/matplotlib-cache")
+os.environ.setdefault("MPLCONFIGDIR", MPL_CACHE_DIR)
+try:
+    os.makedirs(MPL_CACHE_DIR, exist_ok=True)
+except Exception:
+    pass
+
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from dna_features_viewer import GraphicFeature, GraphicRecord
+
+    VIZ_AVAILABLE = True
+    VIZ_IMPORT_ERROR = ""
+except Exception as exc:
+    plt = None
+    GraphicFeature = None
+    GraphicRecord = None
+    VIZ_AVAILABLE = False
+    VIZ_IMPORT_ERROR = clean_text(exc) if "clean_text" in globals() else str(exc)
 
 
 def clean_text(value):
@@ -30,6 +55,560 @@ def read_csv_rows(path):
     return rows
 
 
+def to_int(value):
+    txt = clean_text(value).strip().replace(",", "")
+    if not txt:
+        return None
+    try:
+        return int(float(txt))
+    except ValueError:
+        return None
+
+
+REF_FASTA_PATH = clean_text(os.environ.get("REF_FASTA_PATH", "")).strip()
+VIZ_SNV_CONTEXT_BP = 14
+_FASTA_READER_CACHE = None
+ENSEMBL_SEQUENCE_URL = "https://rest.ensembl.org/sequence/region/human/"
+SNV_SEQUENCE_CACHE_PATH = Path(__file__).resolve().parent.parent / "variant_sequence_cache.json"
+_SNV_SEQUENCE_CACHE = None
+
+
+def load_snv_sequence_cache():
+    global _SNV_SEQUENCE_CACHE
+    if _SNV_SEQUENCE_CACHE is not None:
+        return _SNV_SEQUENCE_CACHE
+    try:
+        if SNV_SEQUENCE_CACHE_PATH.exists():
+            with SNV_SEQUENCE_CACHE_PATH.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+                if isinstance(data, dict):
+                    _SNV_SEQUENCE_CACHE = data
+                    return _SNV_SEQUENCE_CACHE
+    except Exception:
+        pass
+    _SNV_SEQUENCE_CACHE = {}
+    return _SNV_SEQUENCE_CACHE
+
+
+def save_snv_sequence_cache():
+    cache = load_snv_sequence_cache()
+    try:
+        with SNV_SEQUENCE_CACHE_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(cache, handle, ensure_ascii=False)
+    except Exception:
+        return False
+    return True
+
+
+def short_label(value, max_len=42):
+    txt = clean_text(value).strip()
+    if len(txt) <= max_len:
+        return txt
+    return txt[: max_len - 3] + "..."
+
+
+def parse_positions_from_text(value):
+    txt = clean_text(value)
+    pair = re.search(r"(\d+)\D+(\d+)", txt)
+    if pair:
+        a = int(pair.group(1))
+        b = int(pair.group(2))
+        return (min(a, b), max(a, b))
+    single = re.search(r"c\.(-?\d+)", txt)
+    if single:
+        center = int(single.group(1))
+        return (center, center + 1)
+    return None
+
+
+def load_fasta_reader():
+    global _FASTA_READER_CACHE
+    if not REF_FASTA_PATH:
+        return None, "Reference FASTA not configured."
+    fasta_path = Path(REF_FASTA_PATH).expanduser()
+    if not fasta_path.exists():
+        return None, f"Reference FASTA not found: {fasta_path}"
+    fai_path = Path(str(fasta_path) + ".fai")
+    if not fai_path.exists():
+        return None, f"FASTA index (.fai) not found: {fai_path}"
+
+    cached = _FASTA_READER_CACHE
+    if cached and cached.get("path") == str(fasta_path):
+        return cached, ""
+
+    index = {}
+    try:
+        with fai_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 5:
+                    continue
+                chrom = parts[0]
+                index[chrom] = {
+                    "length": int(parts[1]),
+                    "offset": int(parts[2]),
+                    "line_bases": int(parts[3]),
+                    "line_width": int(parts[4]),
+                }
+    except Exception as exc:
+        return None, "Failed reading FASTA index: " + clean_text(exc)
+
+    _FASTA_READER_CACHE = {"path": str(fasta_path), "index": index}
+    return _FASTA_READER_CACHE, ""
+
+
+def resolve_chromosome(chrom_value, index):
+    raw = clean_text(chrom_value).strip()
+    if not raw:
+        return ""
+    base = raw[3:] if raw.lower().startswith("chr") else raw
+    candidates = [raw, base, "chr" + base, raw.upper(), base.upper(), "chr" + base.upper()]
+    lower_map = {k.lower(): k for k in index.keys()}
+    for cand in candidates:
+        if cand in index:
+            return cand
+        mapped = lower_map.get(cand.lower())
+        if mapped:
+            return mapped
+    return ""
+
+
+def fetch_reference_window_local(chrom_value, start_1based, end_1based):
+    reader, err = load_fasta_reader()
+    if err:
+        return "", "", err, ""
+
+    index = reader.get("index", {})
+    chrom = resolve_chromosome(chrom_value, index)
+    if not chrom:
+        return "", "", "Chromosome not found in FASTA index: " + clean_text(chrom_value), ""
+
+    meta = index.get(chrom, {})
+    chrom_len = int(meta.get("length", 0))
+    start = max(1, int(start_1based))
+    end = min(chrom_len, int(end_1based))
+    if end < start:
+        return "", "", "Invalid coordinate window.", ""
+
+    try:
+        seq_chunks = []
+        pos = start
+        with Path(reader["path"]).open("rb") as handle:
+            while pos <= end:
+                line_bases = int(meta["line_bases"])
+                line_width = int(meta["line_width"])
+                base_offset = int(meta["offset"])
+                line_idx = (pos - 1) // line_bases
+                pos_in_line = (pos - 1) % line_bases
+                take = min(line_bases - pos_in_line, end - pos + 1)
+                byte_offset = base_offset + line_idx * line_width + pos_in_line
+                handle.seek(byte_offset)
+                raw = handle.read(take).decode("ascii", errors="ignore")
+                seq_chunks.append(re.sub(r"[^A-Za-z]", "", raw))
+                pos += take
+        return "".join(seq_chunks).upper(), chrom, "", "local_fasta"
+    except Exception as exc:
+        return "", "", "Failed reading FASTA: " + clean_text(exc), ""
+
+
+def normalize_chrom_for_ensembl(chrom_value):
+    raw = clean_text(chrom_value).strip()
+    if raw.lower().startswith("chr"):
+        raw = raw[3:]
+    return raw
+
+
+def fetch_reference_window_remote(chrom_value, start_1based, end_1based):
+    chrom = normalize_chrom_for_ensembl(chrom_value)
+    if not chrom:
+        return "", "", "Missing chromosome for remote sequence lookup.", ""
+    start = max(1, int(start_1based))
+    end = max(start, int(end_1based))
+    region = f"{chrom}:{start}..{end}:1"
+    url = ENSEMBL_SEQUENCE_URL + quote(region)
+    try:
+        request = Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "geno-mock-python/1.0 (+https://github.com/RazaS/geno_mock_python)",
+            },
+        )
+        with urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        seq = clean_text(payload.get("seq", "")).upper()
+        if not seq:
+            return "", "", "Remote sequence API returned empty sequence.", ""
+        return seq, chrom, "", "ensembl_rest"
+    except Exception as exc:
+        return "", "", "Remote sequence lookup failed: " + clean_text(exc), ""
+
+
+def fetch_reference_window(chrom_value, start_1based, end_1based):
+    errors = []
+    if REF_FASTA_PATH:
+        seq, chrom, err, source = fetch_reference_window_local(chrom_value, start_1based, end_1based)
+        if not err and seq:
+            return seq, chrom, "", source
+        if err:
+            errors.append(err)
+
+    seq, chrom, err, source = fetch_reference_window_remote(chrom_value, start_1based, end_1based)
+    if not err and seq:
+        return seq, chrom, "", source
+    if err:
+        errors.append(err)
+    return "", "", " | ".join(errors) if errors else "Sequence lookup failed.", ""
+
+
+def get_ref_alt_bases(row):
+    ref = clean_text(row.get("Ref_allele_curated") or row.get("Ref_allele") or row.get("Ref") or "").strip().upper()
+    alt = clean_text(row.get("Alt_allele_curated") or row.get("Alt_allele") or row.get("Alt") or "").strip().upper()
+    return ref, alt
+
+
+def build_snv_sequence_panel(row):
+    start = to_int(row.get("Hg38_start") or row.get("Start"))
+    end = to_int(row.get("Hg38_end") or row.get("End"))
+    chrom = clean_text(row.get("Chromosome") or row.get("chromosome") or "").strip()
+    if start is None or end is None or not chrom:
+        return {
+            "status": "unavailable",
+            "message": "Sequence unavailable: missing genomic coordinates/chromosome.",
+            "rows": [],
+        }
+    if end < start:
+        start, end = end, start
+
+    ref, alt = get_ref_alt_bases(row)
+    if not (len(ref) == 1 and len(alt) == 1 and re.fullmatch(r"[ACGTN]", ref) and re.fullmatch(r"[ACGTN]", alt) and start == end):
+        return {
+            "status": "not_applicable",
+            "message": "Sequence table shown only for SNVs with single-base REF/ALT.",
+            "rows": [],
+        }
+
+    cache = load_snv_sequence_cache()
+    cache_key = "|".join([clean_text(chrom).upper(), str(start), ref, alt, str(VIZ_SNV_CONTEXT_BP)])
+    cached_panel = cache.get(cache_key)
+    if isinstance(cached_panel, dict):
+        return dict(cached_panel)
+
+    window_start = max(1, start - VIZ_SNV_CONTEXT_BP)
+    window_end = start + VIZ_SNV_CONTEXT_BP
+    seq, resolved_chrom, err, seq_source = fetch_reference_window(chrom, window_start, window_end)
+    if err:
+        return {"status": "unavailable", "message": err, "rows": []}
+    if not seq:
+        return {"status": "unavailable", "message": "Reference sequence not returned.", "rows": []}
+
+    center_idx = start - window_start
+    if center_idx < 0 or center_idx >= len(seq):
+        return {"status": "unavailable", "message": "Variant position outside sequence window.", "rows": []}
+
+    left = seq[:center_idx]
+    center_ref = seq[center_idx]
+    right = seq[center_idx + 1 :]
+    warnings = []
+    if center_ref != ref:
+        warnings.append("Reference mismatch: FASTA has " + center_ref + ", row REF is " + ref + ".")
+
+    rows = [
+        {"label": "Reference (5'→3')", "five_prime": left, "center": center_ref, "three_prime": right},
+        {"label": "Alternate (5'→3')", "five_prime": left, "center": alt, "three_prime": right},
+    ]
+    meta = (
+        resolved_chrom
+        + ":"
+        + str(window_start)
+        + "-"
+        + str(window_end)
+        + " (variant at "
+        + str(start)
+        + ")"
+        + (" | source: " + seq_source if seq_source else "")
+    )
+    panel = {
+        "status": "ok",
+        "message": "SNV local sequence window ±" + str(VIZ_SNV_CONTEXT_BP) + " bp",
+        "meta": meta,
+        "rows": rows,
+        "warnings": warnings,
+    }
+    cache[cache_key] = panel
+    save_snv_sequence_cache()
+    return panel
+
+
+def build_exon_index(rows):
+    index = {}
+    for row in rows:
+        gene = clean_text(row.get("Gene", "")).strip()
+        start = to_int(row.get("Start"))
+        end = to_int(row.get("End"))
+        if not gene or start is None or end is None:
+            continue
+        if end < start:
+            start, end = end, start
+        index.setdefault(gene, []).append(
+            {
+                "start": start,
+                "end": end,
+                "label": clean_text(row.get("Exon_name") or row.get("Exon_ID") or "Exon"),
+                "orientation": clean_text(row.get("Orientation", "")).strip(),
+            }
+        )
+    for gene in index:
+        index[gene].sort(key=lambda r: (r["start"], r["end"]))
+    return index
+
+
+def build_intron_features(sorted_exons, window_start=None, window_end=None):
+    features = []
+    for idx in range(len(sorted_exons) - 1):
+        left = sorted_exons[idx]
+        right = sorted_exons[idx + 1]
+        start = int(left["end"]) + 1
+        end = int(right["start"]) - 1
+        if end <= start:
+            continue
+        if window_start is not None and end < window_start:
+            continue
+        if window_end is not None and start > window_end:
+            continue
+        features.append(
+            {
+                "start": start,
+                "end": end,
+                "label": f"Intron {idx + 1}",
+                "color": "#adb5bd",
+                "strand": +1,
+            }
+        )
+    return features
+
+
+def build_variant_viz_bundle(row):
+    start = to_int(row.get("Hg38_start") or row.get("Start"))
+    end = to_int(row.get("Hg38_end") or row.get("End"))
+    if start is None and end is None:
+        parsed = parse_positions_from_text(row.get("Nucleotide_change") or row.get("DNA Change") or row.get("HGVS Transcript"))
+        if parsed:
+            start, end = parsed
+    if start is None and end is not None:
+        start = end
+    if end is None and start is not None:
+        end = start + 1
+    if start is None or end is None:
+        return {"features": [], "xlim": None, "notes": []}
+    if end < start:
+        start, end = end, start
+    features = []
+    label = short_label(row.get("Nucleotide_change") or row.get("DNA Change") or row.get("Variant_id") or "Variant")
+    features.append({"start": start, "end": max(end, start + 1), "label": label, "color": "#d1495b", "strand": +1})
+
+    gene = clean_text(row.get("Gene", "")).strip()
+    window_start = max(0, start - 20000)
+    window_end = end + 20000
+    exons = EXON_INDEX_BY_GENE.get(gene, [])
+    exons_in_window = []
+    for exon in exons:
+        if exon["end"] < window_start or exon["start"] > window_end:
+            continue
+        exons_in_window.append(exon)
+        strand = -1 if exon.get("orientation") == "-" else +1
+        features.append(
+            {
+                "start": exon["start"],
+                "end": max(exon["end"], exon["start"] + 1),
+                "label": short_label(exon["label"], 28),
+                "color": "#2a9d8f",
+                "strand": strand,
+            }
+        )
+
+    if exons_in_window:
+        features.extend(build_intron_features(exons_in_window, window_start, window_end))
+
+    notes = [
+        "Variant coordinate: " + str(start) + "-" + str(max(end, start + 1)),
+        "Nucleotide change: " + clean_text(row.get("Nucleotide_change") or row.get("DNA Change") or "-"),
+    ]
+    if clean_text(row.get("Exon_Intron")):
+        notes.append("Exon/Intron annotation: " + clean_text(row.get("Exon_Intron")))
+    return {"features": features, "xlim": (window_start, window_end), "notes": notes}
+
+
+def build_exon_viz_bundle(row):
+    start = to_int(row.get("Start"))
+    end = to_int(row.get("End"))
+    if start is None or end is None:
+        return {"features": [], "xlim": None, "notes": []}
+    if end < start:
+        start, end = end, start
+    orientation = clean_text(row.get("Orientation", "")).strip()
+    strand = -1 if orientation == "-" else 1
+    gene = clean_text(row.get("Gene", "")).strip()
+    features = []
+    exons = EXON_INDEX_BY_GENE.get(gene, [])
+    for exon in exons:
+        exon_strand = -1 if exon.get("orientation") == "-" else +1
+        is_selected = exon["start"] == start and exon["end"] == end
+        features.append(
+            {
+                "start": exon["start"],
+                "end": max(exon["end"], exon["start"] + 1),
+                "label": short_label(exon["label"], 28),
+                "color": "#e76f51" if is_selected else "#2a9d8f",
+                "strand": exon_strand,
+            }
+        )
+    features.extend(build_intron_features(exons))
+    notes = [
+        "Exon coordinate: " + str(start) + "-" + str(max(end, start + 1)),
+        "Gene: " + gene,
+    ]
+    return {"features": features, "xlim": (max(0, start - 5000), end + 5000), "notes": notes}
+
+
+def build_isbt_viz_bundle(row):
+    raw_rows = row.get("__raw_variant_rows")
+    if not isinstance(raw_rows, list) or not raw_rows:
+        raw_rows = [row]
+    features = []
+    synthetic_cursor = 1
+    notes = []
+    for raw in raw_rows[:80]:
+        dna = clean_text(raw.get("DNA Change") or raw.get("Nucleotide_change") or raw.get("HGVS Transcript") or raw.get("input"))
+        parsed = parse_positions_from_text(dna)
+        if parsed:
+            start, end = parsed
+        else:
+            start, end = synthetic_cursor, synthetic_cursor + 1
+            synthetic_cursor += 2
+        label = short_label(dna or raw.get("isbt_allele") or raw.get("variant_id") or "ISBT change")
+        features.append({"start": start, "end": max(end, start + 1), "label": label, "color": "#457b9d"})
+        exon_intr = clean_text(raw.get("Exon/Intron") or raw.get("exon_intron") or "")
+        if exon_intr and exon_intr != "-":
+            features.append(
+                {
+                    "start": start,
+                    "end": max(end, start + 1),
+                    "label": short_label(exon_intr, 26),
+                    "color": "#f4a261",
+                    "strand": -1,
+                }
+            )
+        if dna:
+            notes.append(dna)
+    xlim = None
+    numeric_starts = [int(f["start"]) for f in features if isinstance(f.get("start"), int)]
+    numeric_ends = [int(f["end"]) for f in features if isinstance(f.get("end"), int)]
+    if numeric_starts and numeric_ends:
+        xlim = (max(0, min(numeric_starts) - 20), max(numeric_ends) + 20)
+    return {"features": features, "xlim": xlim, "notes": notes[:10]}
+
+
+def encode_dna_feature_plot(features, title, xlim=None):
+    if not features:
+        raise ValueError("No plottable coordinates for this row.")
+    min_pos = min(int(f["start"]) for f in features)
+    max_pos = max(int(f["end"]) for f in features)
+    offset = 0
+    if min_pos < 0:
+        offset = abs(min_pos) + 10
+
+    graphic_features = []
+    for feature in features:
+        start = int(feature["start"]) + offset
+        end = int(feature["end"]) + offset
+        if end <= start:
+            end = start + 1
+        graphic_features.append(
+            GraphicFeature(
+                start=start,
+                end=end,
+                strand=int(feature.get("strand", +1)),
+                color=feature.get("color", "#457b9d"),
+                label=clean_text(feature.get("label", "")),
+            )
+        )
+
+    seq_len = max(int(max_pos + offset + 10), 30)
+    graphic_record = GraphicRecord(sequence_length=seq_len, features=graphic_features)
+    fig_height = min(10, max(3, 1.8 + len(graphic_features) * 0.12))
+    fig, ax = plt.subplots(1, 1, figsize=(12, fig_height))
+    graphic_record.plot(ax=ax)
+    if xlim and len(xlim) == 2:
+        try:
+            x0 = int(xlim[0]) + offset
+            x1 = int(xlim[1]) + offset
+            if x1 > x0:
+                ax.set_xlim(x0, x1)
+        except Exception:
+            pass
+    ax.set_title(clean_text(title))
+    ax.set_xlabel("Position")
+    fig.tight_layout()
+
+    png_buffer = BytesIO()
+    svg_buffer = BytesIO()
+    fig.savefig(png_buffer, format="png", dpi=220)
+    fig.savefig(svg_buffer, format="svg")
+    plt.close(fig)
+    return {
+        "png_base64": base64.b64encode(png_buffer.getvalue()).decode("ascii"),
+        "svg_base64": base64.b64encode(svg_buffer.getvalue()).decode("ascii"),
+    }
+
+
+def build_row_viz_payload(source, row):
+    if not VIZ_AVAILABLE:
+        return {
+            "ok": False,
+            "error": "Visualization backend unavailable. Install dna-features-viewer + matplotlib. " + VIZ_IMPORT_ERROR,
+        }
+    if not isinstance(row, dict):
+        return {"ok": False, "error": "Invalid row payload."}
+
+    src = clean_text(source).strip().lower()
+    sequence_panel = {
+        "status": "not_applicable",
+        "message": "Sequence table is available for SNV variant rows.",
+        "rows": [],
+    }
+    if src == "exon":
+        bundle = build_exon_viz_bundle(row)
+        features = bundle["features"]
+        title = f"Exon Viz: {clean_text(row.get('Exon_name') or row.get('Exon_ID') or row.get('Gene') or '')}"
+    elif src == "variant":
+        bundle = build_variant_viz_bundle(row)
+        features = bundle["features"]
+        title = f"Variant Viz: {clean_text(row.get('Variant_id') or row.get('Nucleotide_change') or '')}"
+        sequence_panel = build_snv_sequence_panel(row)
+    elif src == "isbt":
+        bundle = build_isbt_viz_bundle(row)
+        features = bundle["features"]
+        title = f"ISBT Viz: {clean_text(row.get('ISBT_Allele') or row.get('Allele_id') or row.get('Group') or '')}"
+    else:
+        return {"ok": False, "error": "Unsupported viz source."}
+
+    try:
+        encoded = encode_dna_feature_plot(features, title, bundle.get("xlim"))
+    except Exception as exc:
+        return {"ok": False, "error": clean_text(exc)}
+
+    return {
+        "ok": True,
+        "title": title,
+        "image_png_base64": encoded.get("png_base64", ""),
+        "image_svg_base64": encoded.get("svg_base64", ""),
+        "notes": bundle.get("notes", []),
+        "sequence_panel": sequence_panel,
+    }
+
+
 ROOT_DIR = Path(__file__).resolve().parent.parent
 GENE_CSV = ROOT_DIR / "Gene_table.csv"
 ALLELE_CSV = ROOT_DIR / "Allele_table.csv"
@@ -42,6 +621,31 @@ allele_table = read_csv_rows(ALLELE_CSV)
 variant_table = read_csv_rows(VARIANT_CSV)
 exon_table = read_csv_rows(EXON_CSV)
 bridge_table = read_csv_rows(BRIDGE_CSV)
+EXON_INDEX_BY_GENE = build_exon_index(exon_table)
+
+
+def prefetch_variant_snv_sequences(max_rows=0):
+    downloaded = 0
+    skipped = 0
+    attempted = 0
+    for row in variant_table:
+        start = to_int(row.get("Hg38_start") or row.get("Start"))
+        end = to_int(row.get("Hg38_end") or row.get("End"))
+        chrom = clean_text(row.get("Chromosome") or row.get("chromosome") or "").strip()
+        ref, alt = get_ref_alt_bases(row)
+        if not chrom or start is None or end is None:
+            skipped += 1
+            continue
+        if not (start == end and len(ref) == 1 and len(alt) == 1 and re.fullmatch(r"[ACGTN]", ref) and re.fullmatch(r"[ACGTN]", alt)):
+            skipped += 1
+            continue
+        attempted += 1
+        panel = build_snv_sequence_panel(row)
+        if panel.get("status") == "ok":
+            downloaded += 1
+        if max_rows and attempted >= max_rows:
+            break
+    return {"attempted": attempted, "downloaded_or_cached": downloaded, "skipped": skipped}
 
 for row in allele_table:
     row["Allele_id"] = clean_text(row.get("Allele_id", ""))
@@ -602,6 +1206,13 @@ def load_isbt_dataset():
 
 isbt_data = load_isbt_dataset()
 
+snv_prefetch_summary = {}
+if clean_text(os.environ.get("PREFETCH_SNV_SEQUENCE_CACHE", "0")).strip() == "1":
+    try:
+        snv_prefetch_summary = prefetch_variant_snv_sequences()
+    except Exception as exc:
+        snv_prefetch_summary = {"error": clean_text(exc)}
+
 INIT_PAYLOAD = {
     "gene_table": gene_table,
     "allele_table": allele_table,
@@ -625,6 +1236,12 @@ INIT_PAYLOAD = {
         "exon_view": exon_view_cols,
     },
     "isbt": isbt_data,
+    "snv_sequence_cache": {
+        "enabled": True,
+        "cache_path": str(SNV_SEQUENCE_CACHE_PATH),
+        "cached_entries": len(load_snv_sequence_cache()),
+        "prefetch_summary": snv_prefetch_summary,
+    },
 }
 
 FEEDBACK_LOG = []
@@ -932,6 +1549,22 @@ INDEX_HTML = """<!doctype html>
       width: 34px;
       text-align: center;
     }
+    .viz-cell {
+      width: 72px;
+      text-align: center;
+    }
+    .viz-btn {
+      border: 1px solid #1d4ed8;
+      border-radius: 5px;
+      background: #eff6ff;
+      color: #1e3a8a;
+      font-size: 12px;
+      padding: 4px 8px;
+      cursor: pointer;
+    }
+    .viz-btn:hover {
+      background: #dbeafe;
+    }
     .hidden {
       display: none !important;
     }
@@ -1003,6 +1636,98 @@ INDEX_HTML = """<!doctype html>
       color: #047857;
       font-size: 13px;
       margin-top: 8px;
+    }
+    .viz-image-wrap {
+      width: 100%;
+      height: 100%;
+      overflow: auto;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      background: #f8fafc;
+      padding: 8px;
+    }
+    .viz-image-wrap img {
+      width: auto;
+      max-width: none;
+      height: auto;
+      display: block;
+      background: #fff;
+      border-radius: 6px;
+      transform-origin: top left;
+    }
+    .viz-toolbar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-right: auto;
+    }
+    .viz-scale-label {
+      font-size: 12px;
+      color: #475569;
+      min-width: 44px;
+      text-align: right;
+    }
+    .viz-notes {
+      margin-bottom: 8px;
+      font-size: 13px;
+      color: #334155;
+      border: 1px solid #e2e8f0;
+      background: #f8fafc;
+      border-radius: 6px;
+      padding: 6px 8px;
+      line-height: 1.3;
+    }
+    .viz-seq-panel {
+      margin-top: 10px;
+      border: 1px solid #dbe3ee;
+      border-radius: 6px;
+      background: #ffffff;
+      padding: 8px;
+    }
+    .viz-seq-meta {
+      font-size: 12px;
+      color: #334155;
+      margin-bottom: 6px;
+    }
+    .viz-seq-table-wrap {
+      max-height: 180px;
+      overflow: auto;
+      border: 1px solid #e2e8f0;
+      border-radius: 5px;
+      background: #f8fafc;
+    }
+    .viz-seq-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+    }
+    .viz-seq-table th,
+    .viz-seq-table td {
+      border-bottom: 1px solid #e2e8f0;
+      padding: 6px 8px;
+      text-align: left;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+    .viz-seq-center {
+      font-weight: 700;
+      color: #7f1d1d;
+      background: #fee2e2;
+      border-radius: 3px;
+    }
+    .viz-seq-warn {
+      margin-top: 6px;
+      font-size: 12px;
+      color: #92400e;
+    }
+    .viz-error {
+      color: #991b1b;
+      font-size: 14px;
+      padding: 10px;
+      border: 1px solid #fecaca;
+      background: #fef2f2;
+      border-radius: 6px;
     }
     @media (max-width: 1100px) {
       .app-root {
@@ -1149,6 +1874,24 @@ INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div id="viz-modal" class="modal-overlay">
+    <div class="modal-box">
+      <div id="viz-title" class="modal-head">Visualization</div>
+      <div class="modal-body">
+        <div id="viz-content" class="viz-image-wrap"></div>
+      </div>
+      <div class="modal-footer">
+        <div class="viz-toolbar">
+          <button id="viz-zoom-out-btn" class="btn">-</button>
+          <button id="viz-zoom-in-btn" class="btn">+</button>
+          <button id="viz-zoom-reset-btn" class="btn">Reset</button>
+          <span id="viz-scale-label" class="viz-scale-label">100%</span>
+        </div>
+        <button id="viz-close-btn" class="btn">Close</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let DATA = null;
 
@@ -1161,6 +1904,7 @@ INDEX_HTML = """<!doctype html>
       selectedIsbtGroup: "",
       isbtGroupSearch: "",
       isbtTableSearch: "",
+      vizScale: 1.0,
       panelBCollapsed: false,
       alleleSelectorCollapsed: false,
       isbtSelectorCollapsed: false,
@@ -1389,11 +2133,145 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
+    function closeVizModal() {
+      document.getElementById("viz-modal").classList.remove("open");
+      document.getElementById("viz-content").innerHTML = "";
+      state.vizScale = 1.0;
+      const label = document.getElementById("viz-scale-label");
+      if (label) label.textContent = "100%";
+    }
+
+    function applyVizScale() {
+      const img = document.getElementById("viz-image");
+      const label = document.getElementById("viz-scale-label");
+      if (img) {
+        img.style.transform = "scale(" + state.vizScale + ")";
+      }
+      if (label) {
+        label.textContent = Math.round(state.vizScale * 100) + "%";
+      }
+    }
+
+    function setVizScale(nextScale) {
+      const clamped = Math.max(0.25, Math.min(8.0, nextScale));
+      state.vizScale = clamped;
+      applyVizScale();
+    }
+
+    function renderSequencePanel(sequencePanel) {
+      const panel = document.createElement("div");
+      panel.className = "viz-seq-panel";
+
+      const meta = document.createElement("div");
+      meta.className = "viz-seq-meta";
+      const status = text(sequencePanel && sequencePanel.status ? sequencePanel.status : "unavailable");
+      const message = text(sequencePanel && sequencePanel.message ? sequencePanel.message : "Sequence unavailable.");
+      const metaLine = text(sequencePanel && sequencePanel.meta ? sequencePanel.meta : "");
+      meta.textContent = message + (metaLine ? (" | " + metaLine) : "");
+      panel.appendChild(meta);
+
+      if (status !== "ok") {
+        return panel;
+      }
+
+      const rows = Array.isArray(sequencePanel.rows) ? sequencePanel.rows : [];
+      if (rows.length === 0) {
+        return panel;
+      }
+
+      const wrap = document.createElement("div");
+      wrap.className = "viz-seq-table-wrap";
+      const table = document.createElement("table");
+      table.className = "viz-seq-table";
+      const thead = document.createElement("thead");
+      thead.innerHTML = "<tr><th>Version</th><th>5'</th><th>Variant</th><th>3'</th></tr>";
+      table.appendChild(thead);
+      const tbody = document.createElement("tbody");
+      rows.forEach((row) => {
+        const tr = document.createElement("tr");
+        const tdLabel = document.createElement("td");
+        tdLabel.textContent = text(row.label || "");
+        tr.appendChild(tdLabel);
+        const td5 = document.createElement("td");
+        td5.textContent = text(row.five_prime || "");
+        tr.appendChild(td5);
+        const tdCenter = document.createElement("td");
+        tdCenter.className = "viz-seq-center";
+        tdCenter.textContent = text(row.center || "");
+        tr.appendChild(tdCenter);
+        const td3 = document.createElement("td");
+        td3.textContent = text(row.three_prime || "");
+        tr.appendChild(td3);
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      wrap.appendChild(table);
+      panel.appendChild(wrap);
+
+      const warnings = Array.isArray(sequencePanel.warnings) ? sequencePanel.warnings : [];
+      warnings.forEach((warning) => {
+        const warn = document.createElement("div");
+        warn.className = "viz-seq-warn";
+        warn.textContent = "Warning: " + text(warning);
+        panel.appendChild(warn);
+      });
+      return panel;
+    }
+
+    async function requestVizForRow(vizSource, row) {
+      const modal = document.getElementById("viz-modal");
+      const titleNode = document.getElementById("viz-title");
+      const content = document.getElementById("viz-content");
+      state.vizScale = 1.0;
+      titleNode.textContent = "Rendering visualization...";
+      content.innerHTML = "<div class='muted'>Generating plot...</div>";
+      modal.classList.add("open");
+
+      try {
+        const res = await fetch("/api/viz", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ source: vizSource, row: row || {} })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          titleNode.textContent = "Visualization unavailable";
+          content.innerHTML = "<div class='viz-error'>" + text(data.error || "Unknown error") + "</div>";
+          return;
+        }
+        titleNode.textContent = text(data.title || "Visualization");
+        const notes = Array.isArray(data.notes) ? data.notes : [];
+        const sequencePanel = data.sequence_panel || null;
+        const img = document.createElement("img");
+        img.id = "viz-image";
+        img.alt = "DNA feature visualization";
+        const svgB64 = text(data.image_svg_base64 || "");
+        const pngB64 = text(data.image_png_base64 || "");
+        img.src = svgB64
+          ? ("data:image/svg+xml;base64," + svgB64)
+          : ("data:image/png;base64," + pngB64);
+        content.innerHTML = "";
+        if (notes.length > 0) {
+          const notesDiv = document.createElement("div");
+          notesDiv.className = "viz-notes";
+          notesDiv.textContent = notes.join(" | ");
+          content.appendChild(notesDiv);
+        }
+        content.appendChild(img);
+        content.appendChild(renderSequencePanel(sequencePanel));
+        applyVizScale();
+      } catch (err) {
+        titleNode.textContent = "Visualization unavailable";
+        content.innerHTML = "<div class='viz-error'>Failed to generate visualization.</div>";
+      }
+    }
+
     function renderTable(containerId, config) {
       const container = document.getElementById(containerId);
       container.innerHTML = "";
 
       const rows = config.rows || [];
+      const rawRows = config.rawRows || rows;
       const columns = config.columns || [];
       const checkedSet = config.checkedSet;
       const maxHeight = config.maxHeight || "52vh";
@@ -1401,6 +2279,8 @@ INDEX_HTML = """<!doctype html>
       const truncateTooltipCols = new Set(config.truncateTooltipCols || []);
       const truncateLength = Number.isInteger(config.truncateLength) ? config.truncateLength : 10;
       const wrapCols = new Set(["Allele_name", "Reference_No_PMID", "Accession_number", "Phenotype"]);
+      const vizSource = text(config.vizSource || "").trim();
+      const showViz = !!vizSource;
       const rowKey = typeof config.rowKey === "function"
         ? config.rowKey
         : ((row, idx) => String(idx + 1));
@@ -1433,6 +2313,12 @@ INDEX_HTML = """<!doctype html>
       const hCheck = document.createElement("th");
       hCheck.className = "check-cell";
       htr.appendChild(hCheck);
+      if (showViz) {
+        const hViz = document.createElement("th");
+        hViz.className = "viz-cell";
+        hViz.textContent = "Viz";
+        htr.appendChild(hViz);
+      }
       columns.forEach((col) => {
         const th = document.createElement("th");
         th.textContent = col;
@@ -1445,6 +2331,7 @@ INDEX_HTML = """<!doctype html>
       const tbody = document.createElement("tbody");
       rows.forEach((row, idx) => {
         const key = text(rowKey(row, idx));
+        const rawRow = idx < rawRows.length ? rawRows[idx] : row;
         const tr = document.createElement("tr");
 
         const checkTd = document.createElement("td");
@@ -1464,6 +2351,21 @@ INDEX_HTML = """<!doctype html>
         });
         checkTd.appendChild(cb);
         tr.appendChild(checkTd);
+
+        if (showViz) {
+          const vizTd = document.createElement("td");
+          vizTd.className = "viz-cell";
+          const vizBtn = document.createElement("button");
+          vizBtn.type = "button";
+          vizBtn.className = "viz-btn";
+          vizBtn.textContent = "Viz";
+          vizBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            requestVizForRow(vizSource, rawRow);
+          });
+          vizTd.appendChild(vizBtn);
+          tr.appendChild(vizTd);
+        }
 
         columns.forEach((col) => {
           const td = document.createElement("td");
@@ -1652,15 +2554,18 @@ INDEX_HTML = """<!doctype html>
         return;
       }
       if (state.modal.type === "variants") {
-        const displayRows = state.modal.rows.map((r) => normalizeRow(r, DATA.columns.variant_view));
+        const rawRows = state.modal.rows.slice();
+        const displayRows = rawRows.map((r) => normalizeRow(r, DATA.columns.variant_view));
         renderTable("modal-table", {
           rows: displayRows,
+          rawRows: rawRows,
           columns: DATA.columns.variant_view,
           rowKey: (row, idx) => String(idx + 1),
           checkedSet: state.checked.modalVariants,
           tableKey: "modalVariants",
           truncateTooltipCols: ["Ref_allele_curated", "Alt_allele_curated"],
           truncateLength: 10,
+          vizSource: "variant",
           maxHeight: "45vh"
         });
       } else if (state.modal.type === "alleles") {
@@ -1693,10 +2598,12 @@ INDEX_HTML = """<!doctype html>
       const displayRows = DATA.exon_table.map((r) => normalizeRow(r, DATA.columns.exon_view));
       renderTable("exon-mode", {
         rows: displayRows,
+        rawRows: DATA.exon_table,
         columns: DATA.columns.exon_view,
         rowKey: (row, idx) => String(idx + 1),
         checkedSet: state.checked.exon,
         tableKey: "exon",
+        vizSource: "exon",
         maxHeight: "100%"
       });
     }
@@ -1727,12 +2634,14 @@ INDEX_HTML = """<!doctype html>
         const displayRows = detailRows.map((r) => normalizeRow(r, DATA.columns.variant_view));
         renderTable("detail-table", {
           rows: displayRows,
+          rawRows: detailRows,
           columns: DATA.columns.variant_view,
           rowKey: (row, idx) => String(idx + 1),
           checkedSet: state.checked.detail,
           tableKey: "detail",
           truncateTooltipCols: ["Ref_allele_curated", "Alt_allele_curated"],
           truncateLength: 10,
+          vizSource: "variant",
           maxHeight: "100%",
           onRowClick: (row) => {
             const variantId = text(row.Variant_id);
@@ -1770,11 +2679,13 @@ INDEX_HTML = """<!doctype html>
 
       renderTable("isbt-detail-table", {
         rows: displayRows,
+        rawRows: detailRows,
         columns: columns,
         rowKey: (row, idx) => String(idx + 1),
         checkedSet: state.checked.isbtDetail,
         tableKey: "isbtDetail",
         multilineCols: ["DNA Change", "Exon/Intron", "HGVS Transcript"],
+        vizSource: "isbt",
         maxHeight: "100%"
       });
     }
@@ -1973,6 +2884,9 @@ INDEX_HTML = """<!doctype html>
           lines.push("ISBT cache write warning: " + text(DATA.isbt.metadata.cache_write_error));
         }
       }
+      if (DATA.snv_sequence_cache) {
+        lines.push("SNV sequence cache entries: " + Number(DATA.snv_sequence_cache.cached_entries || 0).toLocaleString());
+      }
       lines.forEach((line) => {
         const li = document.createElement("li");
         li.textContent = line;
@@ -2122,6 +3036,19 @@ INDEX_HTML = """<!doctype html>
       document.getElementById("relation-modal").addEventListener("click", (ev) => {
         if (ev.target.id === "relation-modal") closeRelationModal();
       });
+      document.getElementById("viz-close-btn").addEventListener("click", closeVizModal);
+      document.getElementById("viz-zoom-in-btn").addEventListener("click", () => {
+        setVizScale(state.vizScale * 1.25);
+      });
+      document.getElementById("viz-zoom-out-btn").addEventListener("click", () => {
+        setVizScale(state.vizScale / 1.25);
+      });
+      document.getElementById("viz-zoom-reset-btn").addEventListener("click", () => {
+        setVizScale(1.0);
+      });
+      document.getElementById("viz-modal").addEventListener("click", (ev) => {
+        if (ev.target.id === "viz-modal") closeVizModal();
+      });
     }
 
     async function init() {
@@ -2177,16 +3104,24 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/api/feedback":
-            self._send_json({"ok": False, "error": "Not found"}, status=404)
-            return
-
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length) if length > 0 else b"{}"
         try:
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
             self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+            return
+
+        if parsed.path == "/api/viz":
+            source = clean_text(payload.get("source", ""))
+            row = payload.get("row", {})
+            result = build_row_viz_payload(source, row)
+            status = 200 if result.get("ok") else 400
+            self._send_json(result, status=status)
+            return
+
+        if parsed.path != "/api/feedback":
+            self._send_json({"ok": False, "error": "Not found"}, status=404)
             return
 
         entry = {
