@@ -105,6 +105,7 @@ ISBT_GROUPED_VIEW_COLS = [
     "Group",
     "Allele_id",
     "ISBT_Allele",
+    "Phenotype",
     "Gene_name",
     "DNA Change",
     "Exon/Intron",
@@ -177,6 +178,41 @@ def to_bool_flag_text(value):
     if low in ("0", "false", "f", "no", "n"):
         return "No"
     return txt
+
+
+def extract_isbt_allele_phenotype(record):
+    phenotype = first_nonempty_ci(record, ["Phenotype", "isbt_phenotype", "phenotype"])
+    if phenotype:
+        return phenotype
+
+    raw_phenotypes = first_nonempty_ci(record, ["phenotypes"])
+    if not raw_phenotypes:
+        return ""
+
+    try:
+        parsed = json.loads(raw_phenotypes)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+
+    if not isinstance(parsed, list):
+        return ""
+
+    labels = []
+    seen = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        antigen = item.get("antigen") if isinstance(item.get("antigen"), dict) else {}
+        antigen_name = clean_text(antigen.get("display_name") or antigen.get("isbt_code")).strip()
+        antigen_name = re.sub(r"<[^>]+>", "", antigen_name).strip()
+        phenotype_name = clean_text(item.get("phenotype")).strip()
+        if phenotype_name == "-":
+            phenotype_name = ""
+        label = f"{antigen_name} {phenotype_name}".strip()
+        if label and label not in seen:
+            seen.add(label)
+            labels.append(label)
+    return "; ".join(labels)
 
 
 def normalize_dna_change(raw_value):
@@ -296,6 +332,103 @@ def variant_matches_group(variant_row, selected_group):
     return symbol == group
 
 
+def build_isbt_allele_meta_by_id(alleles_rows):
+    allele_meta_by_id = {}
+    for row in alleles_rows:
+        allele_id = clean_text(row.get("allele_id", "")).strip()
+        if not allele_id:
+            continue
+        meta = allele_meta_by_id.setdefault(allele_id, {})
+        phenotype = extract_isbt_allele_phenotype(row)
+        if phenotype and not clean_text(meta.get("Phenotype", "")).strip():
+            meta["Phenotype"] = phenotype
+        for flag_col in ISBT_FLAG_COLS:
+            flag_value = to_bool_flag_text(first_nonempty_ci(row, [flag_col]))
+            if flag_value and not clean_text(meta.get(flag_col, "")).strip():
+                meta[flag_col] = flag_value
+    return allele_meta_by_id
+
+
+def normalize_isbt_variant_row(row, allele_meta_by_id, idx):
+    out = dict(row)
+    allele_id = first_nonempty_ci(out, ["allele_id"])
+    if not allele_id:
+        allele_id = f"missing:{idx}"
+    out["allele_id"] = allele_id
+    out["isbt_allele"] = first_nonempty_ci(out, ["isbt_allele", "allele_name"])
+    out["gene_name"] = first_nonempty_ci(out, ["gene_name", "gene", "gene_symbol"])
+    out["variant_id"] = first_nonempty_ci(out, ["variant_id", "id"]) or f"v:{idx}"
+
+    dna_change = normalize_dna_change(first_nonempty_ci(out, ["input", "dna_change", "nucleotide_change", "hgvs", "hgvs_c"]))
+    exon_value = first_nonempty_ci(out, ["exon", "exon_number", "exon_no"])
+    intron_value = first_nonempty_ci(out, ["intron", "intron_number", "intron_no"])
+    hgvs_transcript = clean_text(first_nonempty_ci(out, ["input", "hgvs_transcript", "hgvs"])).strip() or "-"
+
+    out["DNA Change"] = dna_change
+    out["Exon/Intron"] = normalize_exon_intron(exon_value, intron_value)
+    out["HGVS Transcript"] = hgvs_transcript
+
+    allele_meta = allele_meta_by_id.get(allele_id, {})
+    phenotype = extract_isbt_allele_phenotype(out) or clean_text(allele_meta.get("Phenotype", "")).strip()
+    out["Phenotype"] = phenotype
+
+    for flag_col in ISBT_FLAG_COLS:
+        if not first_nonempty_ci(out, [flag_col]):
+            out[flag_col] = allele_meta.get(flag_col, "")
+        out[flag_col] = to_bool_flag_text(out.get(flag_col, ""))
+
+    return out
+
+
+def hydrate_isbt_dataset(dataset):
+    if not isinstance(dataset, dict):
+        return empty_isbt_dataset("Invalid ISBT dataset.")
+
+    alleles = [row for row in dataset.get("alleles", []) if isinstance(row, dict)]
+    variants = [row for row in dataset.get("variants", []) if isinstance(row, dict)]
+    antigens = [row for row in dataset.get("antigens", []) if isinstance(row, dict)]
+    systems = [row for row in dataset.get("systems", []) if isinstance(row, dict)]
+
+    for row in alleles:
+        phenotype = extract_isbt_allele_phenotype(row)
+        if phenotype:
+            row["Phenotype"] = phenotype
+        for flag_col in ISBT_FLAG_COLS:
+            row[flag_col] = to_bool_flag_text(first_nonempty_ci(row, [flag_col]))
+
+    allele_meta_by_id = build_isbt_allele_meta_by_id(alleles)
+    normalized_variants = [
+        normalize_isbt_variant_row(row, allele_meta_by_id, idx)
+        for idx, row in enumerate(variants, start=1)
+    ]
+    normalized_variants = dedupe_rows(
+        normalized_variants,
+        ["system_symbol", "allele_id", "variant_id", "DNA Change", "Exon/Intron", "HGVS Transcript"],
+    )
+    grouped_rows = make_isbt_grouped_rows(normalized_variants)
+    raw_export_columns = sorted({key for row in normalized_variants for key in row.keys() if not key.startswith("__")})
+
+    dataset["systems"] = systems
+    dataset["antigens"] = antigens
+    dataset["alleles"] = alleles
+    dataset["variants"] = normalized_variants
+    dataset["grouped_rows"] = grouped_rows
+
+    columns = dataset.setdefault("columns", {})
+    columns["grouped_view"] = ISBT_GROUPED_VIEW_COLS
+    columns["raw_export"] = raw_export_columns
+
+    metadata = dataset.setdefault("metadata", {})
+    row_counts = metadata.setdefault("row_counts", {})
+    row_counts["systems"] = len(systems)
+    row_counts["antigens"] = len(antigens)
+    row_counts["alleles"] = len(alleles)
+    row_counts["variants"] = len(normalized_variants)
+    row_counts["grouped_rows"] = len(grouped_rows)
+
+    return dataset
+
+
 def make_isbt_grouped_rows(variants_rows):
     by_group = {}
     for row in variants_rows:
@@ -342,6 +475,7 @@ def make_isbt_grouped_rows(variants_rows):
                 "Group": group,
                 "Allele_id": first_nonempty_ci(first_row, ["allele_id"]),
                 "ISBT_Allele": first_nonempty_ci(first_row, ["isbt_allele", "allele_name"]),
+                "Phenotype": first_nonempty_ci(first_row, ["Phenotype", "isbt_phenotype", "phenotype"]),
                 "Gene_name": first_nonempty_ci(first_row, ["gene_name", "gene"]),
                 "DNA Change": "\n".join(dna_lines),
                 "Exon/Intron": "\n".join(exon_intron_lines),
@@ -423,6 +557,7 @@ def build_isbt_dataset():
             flat_allele["allele_id"] = allele_id
             flat_allele["isbt_allele"] = first_nonempty_ci(flat_allele, ["isbt_allele", "allele_name", "name"])
             flat_allele["gene_name"] = first_nonempty_ci(flat_allele, ["gene_name", "gene", "gene_symbol"])
+            flat_allele["Phenotype"] = extract_isbt_allele_phenotype(flat_allele)
 
             for flag_col in ISBT_FLAG_COLS:
                 flat_allele[flag_col] = to_bool_flag_text(first_nonempty_ci(flat_allele, [flag_col]))
@@ -463,45 +598,6 @@ def build_isbt_dataset():
             if value and not clean_text(existing.get(key, "")).strip():
                 existing[key] = value
     alleles = list(allele_by_id.values())
-
-    allele_flags_by_id = {
-        clean_text(row.get("allele_id", "")): {flag: clean_text(row.get(flag, "")) for flag in ISBT_FLAG_COLS}
-        for row in alleles
-    }
-
-    normalized_variants = []
-    for idx, row in enumerate(variants, start=1):
-        out = dict(row)
-        allele_id = first_nonempty_ci(out, ["allele_id"])
-        if not allele_id:
-            allele_id = f"missing:{idx}"
-        out["allele_id"] = allele_id
-        out["isbt_allele"] = first_nonempty_ci(out, ["isbt_allele", "allele_name"])
-        out["gene_name"] = first_nonempty_ci(out, ["gene_name", "gene", "gene_symbol"])
-        out["variant_id"] = first_nonempty_ci(out, ["variant_id", "id"]) or f"v:{idx}"
-
-        dna_change = normalize_dna_change(first_nonempty_ci(out, ["input", "dna_change", "nucleotide_change", "hgvs", "hgvs_c"]))
-        exon_value = first_nonempty_ci(out, ["exon", "exon_number", "exon_no"])
-        intron_value = first_nonempty_ci(out, ["intron", "intron_number", "intron_no"])
-        exon_intron = normalize_exon_intron(exon_value, intron_value)
-        hgvs_transcript = clean_text(first_nonempty_ci(out, ["input", "hgvs_transcript", "hgvs"])).strip() or "-"
-
-        out["DNA Change"] = dna_change
-        out["Exon/Intron"] = exon_intron
-        out["HGVS Transcript"] = hgvs_transcript
-
-        allele_flags = allele_flags_by_id.get(allele_id, {})
-        for flag_col in ISBT_FLAG_COLS:
-            if not first_nonempty_ci(out, [flag_col]):
-                out[flag_col] = allele_flags.get(flag_col, "")
-            out[flag_col] = to_bool_flag_text(out.get(flag_col, ""))
-
-        normalized_variants.append(out)
-
-    variants = dedupe_rows(
-        normalized_variants,
-        ["system_symbol", "allele_id", "variant_id", "DNA Change", "Exon/Intron", "HGVS Transcript"],
-    )
     antigens = dedupe_rows(antigens, ["system_symbol", "antigen_id", "id", "name"])
 
     group_symbols = [clean_text(row.get("system_symbol", "")).upper() for row in systems if clean_text(row.get("system_symbol", ""))]
@@ -513,9 +609,6 @@ def build_isbt_dataset():
             groups.append(symbol)
     groups = unique_keep_order(groups)
 
-    grouped_rows = make_isbt_grouped_rows(variants)
-    raw_export_columns = sorted({key for row in variants for key in row.keys() if not key.startswith("__")})
-
     meta = {
         "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "updated_epoch": now_utc_epoch(),
@@ -525,24 +618,24 @@ def build_isbt_dataset():
             "antigens": len(antigens),
             "alleles": len(alleles),
             "variants": len(variants),
-            "grouped_rows": len(grouped_rows),
+            "grouped_rows": 0,
         },
         "pull_errors": pull_errors,
     }
 
-    return {
+    return hydrate_isbt_dataset({
         "metadata": meta,
         "systems": systems,
         "antigens": antigens,
         "alleles": alleles,
         "variants": variants,
         "groups": groups,
-        "grouped_rows": grouped_rows,
+        "grouped_rows": [],
         "columns": {
             "grouped_view": ISBT_GROUPED_VIEW_COLS,
-            "raw_export": raw_export_columns,
+            "raw_export": [],
         },
-    }
+    })
 
 
 def empty_isbt_dataset(error_message=""):
@@ -579,7 +672,7 @@ def load_isbt_dataset():
         if updated_epoch > 0:
             age_days = (now_utc_epoch() - updated_epoch) / 86400.0
             if age_days <= ISBT_CACHE_MAX_DAYS:
-                return cached
+                return hydrate_isbt_dataset(cached)
 
     try:
         fresh = build_isbt_dataset()
@@ -587,7 +680,7 @@ def load_isbt_dataset():
         if cached:
             cached_meta = cached.setdefault("metadata", {})
             cached_meta["refresh_error"] = clean_text(exc)
-            return cached
+            return hydrate_isbt_dataset(cached)
         return empty_isbt_dataset(clean_text(exc))
 
     # Cache write failures should not discard freshly pulled data.
@@ -597,7 +690,7 @@ def load_isbt_dataset():
     except OSError as exc:
         fresh_meta = fresh.setdefault("metadata", {})
         fresh_meta["cache_write_error"] = clean_text(exc)
-    return fresh
+    return hydrate_isbt_dataset(fresh)
 
 
 isbt_data = load_isbt_dataset()
